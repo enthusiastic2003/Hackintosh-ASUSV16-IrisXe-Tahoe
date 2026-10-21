@@ -1163,6 +1163,20 @@
 				<key>Arguments</key>
 				<string></string>
 				<key>Comment</key>
+				<string>HFS+ (reads the macOS recovery image)</string>
+				<key>Enabled</key>
+				<true/>
+				<key>HideVerbose</key>
+				<false/>
+				<key>LoadEarly</key>
+				<false/>
+				<key>Path</key>
+				<string>OpenHfsPlus.efi</string>
+			</dict>
+			<dict>
+				<key>Arguments</key>
+				<string></string>
+				<key>Comment</key>
 				<string>Not shipped (Apple binary). Get it from acidanthera/OcBinaryData if you need HFS+ media.</string>
 				<key>Enabled</key>
 				<false/>
