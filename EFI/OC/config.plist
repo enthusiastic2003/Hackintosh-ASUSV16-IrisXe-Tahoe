@@ -458,7 +458,7 @@
 				<key>BundlePath</key>
 				<string>HoRNDIS.kext</string>
 				<key>Comment</key>
-				<string>Android USB tethering (RNDIS), Apheleos fork 9.4</string>
+				<string>Android USB tethering (RNDIS), original jwise/HoRNDIS 9.2</string>
 				<key>Enabled</key>
 				<true/>
 				<key>ExecutablePath</key>

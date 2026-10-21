@@ -71,12 +71,12 @@ Serial/MLB/UUID are empty and ROM is zero in the tracked folder. Generate yours 
 
 ## Network during the install (Android USB tethering)
 
-The Realtek Wi-Fi has no macOS driver, so the EFI carries **HoRNDIS 9.4** ([Apheleos fork](https://github.com/Apheleos/HoRNDIS),
-Intel kext, extracted from its release `.pkg`; the same tethering worked under Sequoia on this laptop) and injects it in both
-configs, so a phone in *USB tethering* mode gives the macOS installer/Recovery network access. Caveats: the fork's README
-lists macOS 11–15 and says Tahoe is not supported, and its `.pkg` refuses to install on macOS 26 (that only affects the
-package; OpenCore injects the kext directly). If it does not load on Tahoe, a USB ethernet adapter is the fallback. After
-installing, the kext is injected on every boot; no separate install is needed.
+The Realtek Wi-Fi has no macOS driver, so the EFI carries the **original HoRNDIS 9.2** ([jwise/HoRNDIS](https://github.com/jwise/horndis)
+release `rel9.2`, 2018, extracted from its `.pkg`; the same tethering worked under Sequoia on this laptop) and injects it in
+both configs, so a phone in *USB tethering* mode gives the macOS installer/Recovery network access. It is a thin x86_64 kext
+that uses `IOUSBHostFamily`. Its last release predates Tahoe and nobody has reported it on macOS 26, so whether it loads
+there is **untested**; a USB ethernet adapter is the fallback. After installing, the kext is injected from the EFI on every
+boot; no separate install is needed. Check with `kextstat | grep -i horndis` and `networksetup -listallhardwareports`.
 
 ## Bring-up order
 
