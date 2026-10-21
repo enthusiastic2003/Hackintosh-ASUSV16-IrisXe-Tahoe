@@ -1,12 +1,12 @@
-# Aceleração da Iris Xe no macOS Tahoe — Dell XPS 13 Plus (9320)
+# Aceleração da Iris Xe no macOS Tahoe — ASUS Vivobook V16 (V3607VH)
 
-Aceleração gráfica de verdade (**Metal, Core Animation, Liquid Glass**) para a **Intel Iris Xe do i7-1360P (Raptor Lake-P, 8086:A7A0)** no **macOS Tahoe 26.7.1**, num hackintosh com OpenCore.
+Aceleração gráfica de verdade (**Metal, Core Animation, Liquid Glass**) para a **Intel Graphics do Core 7 240H (Raptor Lake-H, 8086:A7AB, 64 EU)** no **macOS Tahoe 26.7.1**, num hackintosh com OpenCore.
 
 A Apple nunca fez driver para o Raptor Lake. Este projeto roda **o driver que a própria Apple fez para a Iris Xe do Tiger Lake** (GPUDriversIntel 16.0.32, de Macs que nunca foram lançados) na GPU mais nova, porque as duas têm a mesma arquitetura (Xe-LP, Gen12). Um **NootedGreen modificado** (plugin do Lilu) corrige as diferenças no kernel, e um conjunto de patches de user space adapta esse driver de 2020 ao Metal do Tahoe.
 
-> 🚧 **Projeto em andamento: este repositório é um retrato vivo do trabalho.** O desenvolvimento acontece dia a dia
-> no próprio XPS 13 Plus do autor, e cada correção entra aqui depois de confirmada no hardware real. Atualizações
-> frequentes; veja o [CHANGELOG.md](CHANGELOG.md) (o que mudou e o que ainda está em teste).
+> 🚧 **Projeto em andamento: este é um port e ainda não foi inicializado.** A pilha de GPU foi desenvolvida e
+> verificada em outro notebook (o projeto upstream); o que está marcado como funcionando foi confirmado lá, não no
+> Vivobook V16. Veja o [CHANGELOG.md](CHANGELOG.md) e o [docs/ASUS-V16.md](docs/ASUS-V16.md).
 
 > ⚠️ **Experimental.** Ainda acontecem travamentos da GPU e kernel panics de vez em quando. Tenha sempre um segundo disco de boot (ou o instalador no USB). Leia [docs/STATUS.md](docs/STATUS.md) antes de começar.
 
@@ -40,6 +40,6 @@ A documentação técnica está em inglês. Os comentários do código estão, e
 
 ## Créditos e licença
 
-Base: **NootedGreen** de StezzaPilot (licença *Thou Shalt Not Profit 1.0*, que vale também para este fork). Referências: WhateverXe e o fork do OCLP de b00t0x, IntelIGPU-Tahoe, acidanthera, OpenIntelWireless, VoodooI2C. Desenvolvido num XPS 13 Plus pelo próprio dono, em parceria com o Claude (Anthropic).
+Base: **NootedGreen** de StezzaPilot (licença *Thou Shalt Not Profit 1.0*, que vale também para este fork). Referências: WhateverXe e o fork do OCLP de b00t0x, IntelIGPU-Tahoe, acidanthera, OpenIntelWireless, VoodooI2C. Fork de [JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe), onde essa pilha de GPU foi desenvolvida e verificada, em parceria com o Claude (Anthropic).
 
 **Nenhum binário da Apple está incluído.** Você precisa da sua própria cópia dos bundles 16.0.32.

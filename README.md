@@ -1,13 +1,13 @@
-# Iris Xe acceleration on macOS Tahoe — Dell XPS 13 Plus (9320)
+# Iris Xe acceleration on macOS Tahoe — ASUS Vivobook V16 (V3607VH)
 
-Hardware-accelerated graphics (**Metal, Core Animation, Liquid Glass**) for the **Intel Iris Xe of the i7-1360P (Raptor Lake-P, 8086:A7A0)** on **macOS Tahoe 26.7.1**, in an OpenCore hackintosh.
+Hardware-accelerated graphics (**Metal, Core Animation, Liquid Glass**) for the **Intel Graphics of the Core 7 240H (Raptor Lake-H, 8086:A7AB, 64 EU)** on **macOS Tahoe 26.7.1**, in an OpenCore hackintosh.
 
 There is no Apple driver for Raptor Lake. This project runs **Apple's own driver for Tiger Lake Iris Xe** (GPUDriversIntel 16.0.32, written for Macs that never shipped) on the newer GPU. Both GPUs share the Xe-LP (Gen12) architecture. A modified **NootedGreen** Lilu plugin bridges the generation gap in the kernel, and a set of user-space patches bridges the gap between that 2020-era driver and Tahoe's Metal stack.
 
-> 🚧 **Work in progress — this repository is a living snapshot.** Development happens day by day on the author's own
-> XPS 13 Plus, and every fix is committed here after it is confirmed on real hardware. Expect frequent updates;
-> see [CHANGELOG.md](CHANGELOG.md) for what changed and what is still being tested, and the
-> [releases](../../releases) for the stable points.
+> 🚧 **Work in progress — this is a port, and it has not been booted yet.** The GPU stack was developed and verified on
+> a different laptop (the upstream project this was forked from); everything marked ✅ below was confirmed there, not on
+> the Vivobook V16. Expect changes as the first boots on this machine are debugged; see
+> [CHANGELOG.md](CHANGELOG.md) and [docs/ASUS-V16.md](docs/ASUS-V16.md) for what is known and what is a guess.
 
 > 🇧🇷 Leia em português: [README.pt-BR.md](README.pt-BR.md)
 
@@ -17,10 +17,13 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 
 ## What works
 
+> Confirmed on the reference laptop this stack was developed on (96-EU GPU, 3840×2400 panel). **None of it has been
+> verified on the Vivobook V16 yet** (64-EU A7AB, 1920×1200 panel); treat every row as the goal, not a result.
+
 | Area | Status |
 |---|---|
 | Desktop, Dock, windows, Liquid Glass blur | ✅ GPU-accelerated through Metal |
-| Native panel resolution (3840×2400) and HiDPI scaling (1280–1920 pt wide) | ✅ (switch with `tools/xe-res`, not System Settings) |
+| Native panel resolution and HiDPI scaling | ✅ on the reference 3840×2400 panel (switch with `tools/xe-res`, not System Settings); the V16's 1920×1200 panel is untested |
 | GPU clock | ✅ 1100 MHz floor while busy (`ngreengtfreq`), idles in RC6 |
 | HEIC / YUV images (wallpapers, photos) | ✅ |
 | App icons, Finder icons, image thumbnails | ✅ |
@@ -31,7 +34,7 @@ There is no Apple driver for Raptor Lake. This project runs **Apple's own driver
 | System Settings › Displays | ⚠️ may panic, change resolution with `tools/xe-res` |
 | WindowServer hang | ⚠️ occasionally before login, and sometimes when changing the UI scale (reboot recovers) |
 
-Everything else about the laptop (Wi-Fi via itlwm/HeliPort, Bluetooth, keyboard/trackpad/touchscreen via VoodooI2C, NVMe, battery) is a regular OpenCore setup. Internal audio (SoundWire RT714/RT1316) and the camera do **not** work on macOS.
+Everything else about the Vivobook V16 is a regular OpenCore setup (keyboard/touchpad via VoodooPS2/VoodooI2C, NVMe, battery, USB map, AppleALC audio on the Realtek ALC256 — all taken from an EFI that booted Sequoia on this laptop). The Realtek 8852BE Wi-Fi and the Realtek USB Bluetooth have **no macOS driver** (use ethernet or a USB adapter), the RTX 5050 is disabled, and the camera is not supported.
 
 ## How it works (one paragraph)
 
@@ -40,7 +43,7 @@ The EFI presents the GPU as Tiger Lake (`device-id 9A49`). Apple's TGL kexts loa
 ## Repository layout
 
 ```
-EFI/                     OpenCore EFI for the XPS 13 Plus 9320 (serials removed — generate your own)
+EFI/                     OpenCore EFI for the Vivobook V16 (serials removed — generate your own)
   OC/config.plist        accelerated config
   OC/config-install.plist  safe config for installing macOS (NootedGreen off, verbose)
 src/NootedGreen/         the modified NootedGreen source (Lilu plugin)
@@ -56,12 +59,12 @@ Documentation: [INSTALL](docs/INSTALL.md) · [STATUS](docs/STATUS.md) · [KERNEL
 [METAL](docs/METAL.md) · [DEBUGGING](docs/DEBUGGING.md) · [HISTORY](docs/HISTORY.md) (how it was done, phase by phase) ·
 [EXPERIMENTS](docs/EXPERIMENTS.md) (what failed and why) · [CATALOG](docs/CATALOG.md) (full patch and tool reference)
 
-## Quick start (Dell XPS 13 Plus 9320)
+## Quick start (ASUS Vivobook V16, V3607VH)
 
 **1. Make your EFI** (on any Mac, with git):
 
 ```sh
-git clone https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe.git && cd Hackintosh-XPS13Plus-IrisXe-Tahoe
+git clone https://github.com/enthusiastic2003/Hackintosh-ASUSV16-IrisXe-Tahoe.git && cd Hackintosh-ASUSV16-IrisXe-Tahoe
 zsh make-efi.sh        # -> dist/EFI with YOUR OWN serial numbers (never share them)
 ```
 
@@ -75,14 +78,15 @@ xcode-select --install          # Command Line Tools, once
 zsh install.sh                  # checks, downloads Apple's driver bundles via NootedGreen, builds, installs
 ```
 
-Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/`, approve the extension if asked, reboot.
+Copy the freshly built `build/NootedGreen.kext` to `EFI/OC/Kexts/` (the one in the repo is stale and still assumes a
+96-EU GPU), approve the extension if asked, reboot.
 `zsh install.sh --check` only runs the checks; `zsh install.sh --uninstall` removes everything.
 
 Other hardware (other Raptor Lake / Alder Lake laptops): the user-space part is the same, but you need your own
 EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTALL.md](docs/INSTALL.md).
 
-**ASUS Vivobook V16 (V3607VH, Core 7 240H, iGPU `A7AB`, 64 EU):** an untested port lives in `EFI-ASUS/`
-(`zsh make-efi.sh asus`); the topology is now derived per GPU. See [docs/ASUS-V16.md](docs/ASUS-V16.md).
+The laptop-specific details (what was changed for the A7AB, what is still a guess, bring-up order) are in
+[docs/ASUS-V16.md](docs/ASUS-V16.md).
 
 ## Credits
 
@@ -90,7 +94,7 @@ EFI (ACPI, USB map, input devices). The full manual procedure is in [docs/INSTAL
 - **WhateverXe** and **OpenCore Legacy Patcher fork** by b00t0x: reference for Gen12 on macOS.
 - **IntelIGPU-Tahoe**: reference for running the TGL Metal driver on Tahoe.
 - **acidanthera** (OpenCore, Lilu, WhateverGreen, VirtualSMC, MacKernelSDK), **OpenIntelWireless** (itlwm, IntelBluetoothFirmware), **VoodooI2C**, **USBToolBox**.
-- Developed on one Dell XPS 13 Plus by its owner, pair-programming with Claude (Anthropic).
+- Forked from [JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe](https://github.com/JulioNectar/Hackintosh-XPS13Plus-IrisXe-Tahoe), where this GPU stack was developed and verified (pair-programming with Claude, Anthropic). The Vivobook V16 port was done the same way.
 
 ## License
 

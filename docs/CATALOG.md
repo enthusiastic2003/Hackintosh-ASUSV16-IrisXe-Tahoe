@@ -5,7 +5,7 @@ behind each item see [HISTORY.md](HISTORY.md); abandoned approaches are collecte
 
 Scope: the forked NootedGreen kernel plugin (`src/NootedGreen`), compared against upstream NootedGreen commit `95f8189` ("V212 add"), plus the user-space Metal-driver patches, libxedrv, the LLVM bridge, install scripts and diagnostic tools.
 
-Target hardware: Intel Raptor Lake-P iGPU `8086:A7A0`, driven through Apple's Tiger Lake driver `AppleIntelTGLGraphics` 16.0.32 on macOS Tahoe 26.7.1. The plugin detects real TGL by CPU model `0x8C`/`0x8D` (`isRealTGL`). Everything else runs the "spoofed / non-real-TGL" paths.
+Target hardware: Intel Raptor Lake-P/H iGPU (`8086:A7A0` on the reference laptop where this was developed; `8086:A7AB` on the ASUS Vivobook V16), driven through Apple's Tiger Lake driver `AppleIntelTGLGraphics` 16.0.32 on macOS Tahoe 26.7.1. The plugin detects real TGL by CPU model `0x8C`/`0x8D` (`isRealTGL`). Everything else runs the "spoofed / non-real-TGL" paths.
 
 Sections 4.4 and 5 describe the original development tree (`build/…`, `nooted/tahoe/…`, `tools/…`) that this
 repository was cut from. Only part of it ships here: see `macos/`, `tools/` and `tools/diagnostics/`.

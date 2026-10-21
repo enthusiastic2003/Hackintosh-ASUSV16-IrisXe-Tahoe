@@ -1,8 +1,7 @@
 #!/bin/zsh
-# Builds a ready-to-use OpenCore EFI with YOUR OWN serial numbers.
+# Builds a ready-to-use OpenCore EFI for the ASUS Vivobook V16 (Core 7 240H) with YOUR OWN serial numbers.
 #
-#   zsh make-efi.sh                 -> Dell XPS 13 Plus 9320 (i7-1360P):  dist/EFI and dist/EFI-XPS13Plus-9320.zip
-#   zsh make-efi.sh asus            -> ASUS Vivobook V16 (Core 7 240H):   dist/EFI-ASUS and dist/EFI-ASUS-V16.zip
+#   zsh make-efi.sh                 -> dist/EFI and dist/EFI-ASUS-V16.zip
 #
 # Every machine needs unique SMBIOS data (serial, MLB, UUID, ROM): sharing one set between machines breaks iCloud /
 # iMessage and can get Apple IDs flagged. This script downloads Apple-compatible serial tooling (macserial, from the
@@ -12,11 +11,7 @@
 # Works on macOS (uses the macOS macserial binary). On Linux, run macserial.linux by hand and use plutil-like edits.
 set -e
 ROOT=${0:A:h}
-case ${1:-dell} in
-  dell) SRC=$ROOT/EFI;      OUT=EFI;      ZIP=EFI-XPS13Plus-9320.zip ;;
-  asus) SRC=$ROOT/EFI-ASUS; OUT=EFI-ASUS; ZIP=EFI-ASUS-V16.zip ;;
-  *) echo "usage: zsh make-efi.sh [dell|asus]"; exit 1 ;;
-esac
+SRC=$ROOT/EFI; OUT=EFI; ZIP=EFI-ASUS-V16.zip
 OC_VER=1.0.8
 DEPS=$ROOT/build/deps; DIST=$ROOT/dist
 mkdir -p $DEPS $DIST

@@ -1,6 +1,6 @@
 #!/bin/zsh
 # Compila o BlackHole (saída de áudio virtual, GPL-3.0, github.com/ExistentialAudio/BlackHole) sem Xcode.
-# Motivo: o XPS 13 Plus não tem saída de áudio no macOS (SoundWire), e o Safari não toca vídeo sem uma.
+# Motivo: o Safari não toca vídeo sem uma saída de áudio; use isto se o áudio interno (AppleALC) não funcionar no Vivobook V16.
 #   zsh tools/build-blackhole.sh   -> build/BlackHole2ch.driver
 # Instalar: sudo cp -R build/BlackHole2ch.driver /Library/Audio/Plug-Ins/HAL/ && sudo killall coreaudiod
 set -e

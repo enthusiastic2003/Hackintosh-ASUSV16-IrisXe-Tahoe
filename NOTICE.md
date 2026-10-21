@@ -7,8 +7,8 @@
 - **Third-party components in `EFI/`** keep their own licenses: OpenCore, Lilu, WhateverGreen, VirtualSMC, NVMeFix,
   RestrictEvents, BrightnessKeys, CpuTopologyRebuild (acidanthera and contributors); itlwm, IntelBluetoothFirmware,
   IntelBTPatcher (OpenIntelWireless); VoodooI2C and VoodooPS2 (their authors); USBToolBox (dhinakg); AppleALC and
-  ECEnabler (acidanthera and contributors, used in `EFI-ASUS/`). See each
+  ECEnabler (acidanthera and contributors). See each
   project for its terms.
 - **Apple software is not included.** The scripts patch your own copy of Apple's GPUDriversIntel 16.0.32 bundles at
   install time. Apple, macOS, Metal and related names are trademarks of Apple Inc.; this project is not affiliated
-  with or endorsed by Apple, Intel or Dell.
+  with or endorsed by Apple, Intel or ASUS.

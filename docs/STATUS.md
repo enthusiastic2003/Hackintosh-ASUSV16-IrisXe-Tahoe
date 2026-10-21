@@ -1,5 +1,9 @@
 # Status (October 2026, macOS Tahoe 26.7.1 25G241)
 
+> Everything below was observed on the **reference laptop** this GPU stack was developed on (A7A0, 96 EU, 3840×2400
+> panel). The ASUS Vivobook V16 port has **not been booted yet**; see [ASUS-V16.md](ASUS-V16.md) for what is expected to
+> differ.
+
 ## Works
 
 - Metal desktop: WindowServer, Dock, Finder, Liquid Glass materials, Mission Control, animations at 60 Hz.

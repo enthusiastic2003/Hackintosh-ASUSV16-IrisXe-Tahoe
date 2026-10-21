@@ -1,6 +1,10 @@
 # Project history
 
-How the Iris Xe of a Dell XPS 13 Plus 9320 (i7-1360P, Raptor Lake-P, `8086:A7A0`) went from a 1024×768 firmware
+> This log was written on the **reference laptop** where the GPU stack was developed (an i7-1360P, Raptor Lake-P,
+> `8086:A7A0`, 96 EU, 3840×2400 panel) and is kept as the engineering record. It does not describe the ASUS Vivobook V16
+> port, which has not been booted yet: see [ASUS-V16.md](ASUS-V16.md).
+
+How the Iris Xe of the reference laptop (i7-1360P, Raptor Lake-P, `8086:A7A0`) went from a 1024×768 firmware
 framebuffer to a Metal-accelerated macOS Tahoe 26.7.1 desktop, running Apple's Tiger Lake driver (GPUDriversIntel
 16.0.32) through a modified NootedGreen plus user-space patches.
 
