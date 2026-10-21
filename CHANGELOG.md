@@ -8,6 +8,7 @@ The full story behind each item is in [docs/HISTORY.md](docs/HISTORY.md).
 
 | Date | Change | Status |
 |---|---|---|
+| 2026-10-21 | **ASUS Vivobook V16 port (Core 7 240H, `8086:A7AB`, 64 EU)**: GPU topology patch (`f3b/f3bb/f3bbb`) is no longer fixed at 96 EU/12 subslices; default follows the real device-id (A7AB → 4 DSS/8 subslices) with `ngreendss=` / `ngreenl3=` overrides. New `EFI-ASUS/` (built by `tools/make-asus-efi.py`, `zsh make-efi.sh asus`) from this EFI plus a Sequoia EFI verified on the laptop. See [docs/ASUS-V16.md](docs/ASUS-V16.md) | not booted yet |
 | 2026-10-21 | **XE-BLITALIGN v2**: only misaligned large copies go to the copy engine; aligned ones use the 3D blit again. Fixes the missing Chrome toolbar/page icons caused by v1 (confirmed by a boot with the patch off); screen recording and video conversions still pass | confirmed |
 | 2026-10-21 | AppleGVA `hwgva-id` is now the real board-id (was iMacPro1,1 from NootedRed, which makes AppleGVA accept only AMD plugins) and XE-GVAID (IOVARendererID 0x1080080 with `-ngreengva`) | testing |
 | 2026-10-21 | Hardware decode bring-up (WIP, off by default): `macos/vadriver/` patches the TGL VA plugin (device-id 9A49, VAME name, Tahoe bitstream request, unknown driver parameter, capability-node layout 0x430→0x438); install in `/Library/GPUBundles`. AppleGVA now creates the decoder up to the NV12 output surface. Tracer: `tools/diagnostics/xe-vatrace.c` | in progress |
