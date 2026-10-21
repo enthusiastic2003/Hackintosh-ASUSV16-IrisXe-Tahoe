@@ -127,6 +127,10 @@ static constexpr DeviceList g12_rpl[] = {
     {0xA7A1, "Intel Iris Xe Graphics"},
     {0xA7A8, "Intel UHD Graphics"},
     {0xA7A9, "Intel UHD Graphics"},
+    {0xA7AA, "Intel Graphics"},
+    {0xA7AB, "Intel Graphics"},
+    {0xA7AC, "Intel Graphics"},
+    {0xA7AD, "Intel Graphics"},
     {0xA720, "Intel UHD Graphics"},
     {0xA721, "Intel UHD Graphics"},
 };

@@ -1977,7 +1977,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3b[] = {// jmp L3BankCount
 			0x74, 0x23, 0x83, 0xf9, 0x02, 0x0f, 0x85, 0x89, 0x01, 0x00, 0x00, 0x83, 0xfe, 0x01, 0x75, 0x59, 0x83, 0xfa, 0x0c, 0x75, 0x54, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
-		static const uint8_t r3b[] = {
+		static uint8_t r3b[] = {
 			0x90, 0x90, 0x83, 0xf9, 0x02, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x83, 0xfe, 0x01, 0x90, 0x90, 0x83, 0xfa, 0x0c, 0x90, 0x90, 0x41, 0xc7, 0x87, 0x64, 0x11, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00
 		};
 		
@@ -2001,9 +2001,24 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		static const uint8_t f3bbb[] = {//NumSubSlices
 			0x8b, 0x5d, 0xd0, 0xf3, 0x0f, 0xb8, 0xf3, 0x01, 0xf6, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
-		static const uint8_t r3bbb[] = {
+		static uint8_t r3bbb[] = {
 			0x8b, 0x5d, 0xd0, 0xbe, 0x0c, 0x00, 0x00, 0x00, 0x90, 0x41, 0x89, 0xb7, 0x58, 0x11, 0x00, 0x00
 		};
+		// Topology is per-SKU: A7A0 is 96 EU (6 DSS -> 12 SS), A7AB (Core 5/7 "Series 2", e.g. Core 7 240H) is 64 EU
+		// (4 DSS -> 8 SS). Defaults follow the real PCI device-id (read before the config-read spoof is routed);
+		// ngreendss=<DSS count> and ngreenl3=<L3 banks> override. MaxEU/SS stays 8 (two 8-EU subslices per DSS).
+		{
+			uint32_t dss = (NGreen::callback && NGreen::callback->deviceId == 0xA7AB) ? 4 : 6;
+			uint32_t l3banks = 8;
+			PE_parse_boot_argn("ngreendss", &dss, sizeof(dss));
+			PE_parse_boot_argn("ngreenl3", &l3banks, sizeof(l3banks));
+			if (dss < 1 || dss > 8) dss = 6;
+			if (l3banks < 1 || l3banks > 16) l3banks = 8;
+			r3bbb[4] = static_cast<uint8_t>(dss * 2);
+			r3b[28] = static_cast<uint8_t>(l3banks);
+			SYSLOG("ngreen", "topology: deviceId=0x%x DSS=%u (SS=%u, EU=%u) L3 banks=%u",
+				   NGreen::callback ? NGreen::callback->deviceId : 0, dss, dss * 2, dss * 16, l3banks);
+		}
 		
 		// GPU caps override (disabled) – would change MaxSlices 6→5, SARation 2→1, MaxEU/SS 6→5.
 		// Leave disabled unless acceleration shows wrong Metal tier/feature set.
@@ -2506,7 +2521,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 		SYSLOG("ngreen", "Loaded AppleIntelTGLGraphics! %s",
 			   NGreen::callback->isRealTGL ? "Real TGL — native topology" :
-			   "RPL spoofed — slices=1 subslices=12(6DSS) maxEU/SS=8 totalEU=96 L3=8");
+			   "RPL spoofed — slices=1 maxEU/SS=8, subslices/L3 per topology line above");
 
 		return true;
 	}
