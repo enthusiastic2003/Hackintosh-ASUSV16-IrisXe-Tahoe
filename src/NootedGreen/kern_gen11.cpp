@@ -11,6 +11,8 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+#include <sys/sysctl.h>
+#include <sys/errno.h>
 // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
 extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
 static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
@@ -83,8 +85,10 @@ static volatile uint32_t gFbModeArgSeen = 0;
 static volatile uint32_t gTglFbBlockRuns = 0, gTglFbRoutesDone = 0, gIcLFbBlockRuns = 0;
 static volatile uint64_t gOrgGcdm = 0, gOrgGpi = 0, gOrgVdm = 0;
 
+static void xeBrightnessRegister();   // panel brightness sysctls, defined next to xeFixFilterWrite
 void Gen11::init() {
 	callback = this;
+	xeBrightnessRegister();
 
 	if (checkKernelArgument("-ngreentglfb") || checkKernelArgument("-ngreentglwithgfx")) {
 		SYSLOG("ngreen", "Gen11::init: FB tier → TGL (ICL FB skipped)");
@@ -3927,6 +3931,90 @@ static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
 	if (nseen < 8) seen[nseen++] = val;
 	return val;
 }
+// ===== Panel brightness (PCH PWM backlight, "south" controller 1) =====
+// macOS has no backlight service for this panel (DisplayServicesCanChangeBrightness is false), so brightness is driven here:
+//   sysctl kern.xe_brightness        percent 1..100, read/write (any user; the panel is the only thing it can touch)
+//   sysctl kern.xe_backlight_regs    read-only dump of BLC_PWM_PCH_CTL1/FREQ1/DUTY1 and the legacy CPU PWM block
+//   boot-arg ngreenbright=N          initial level, applied when Apple writes the duty
+// duty = period * (pct/100)^2.2 (perceptual), the period comes from the hardware. Refused when the PWM is off or the period
+// is invalid (that would mean an eDP AUX backlight, which is not implemented).
+static const uint32_t gXeBrGamma[101] = {  // round((i/100)^2.2 * 2^20)
+	0, 42, 192, 468, 881, 1440, 2150, 3019, 4049, 5247,
+	6616, 8160, 9881, 11784, 13870, 16144, 18606, 21261, 24110, 27156,
+	30399, 33844, 37491, 41343, 45401, 49667, 54143, 58830, 63731, 68845,
+	74177, 79725, 85493, 91481, 97691, 104124, 110781, 117664, 124774, 132112,
+	139679, 147477, 155506, 163769, 172265, 180995, 189962, 199166, 208608, 218289,
+	228210, 238371, 248775, 259422, 270313, 281448, 292829, 304456, 316331, 328454,
+	340826, 353448, 366321, 379445, 392822, 406452, 420336, 434475, 448869, 463519,
+	478427, 493592, 509016, 524699, 540642, 556845, 573310, 590037, 607027, 624280,
+	641797, 659579, 677627, 695940, 714520, 733367, 752483, 771867, 791520, 811443,
+	831636, 852101, 872837, 893845, 915127, 936681, 958510, 980613, 1002992, 1025646,
+	1048576
+};
+static volatile uint32_t gXeBrPct = 0;   // 0 = never set: Apple's own duty writes pass through
+static uint32_t xeBrDuty(uint32_t pct, uint32_t period) {
+	if (pct < 1) pct = 1;
+	if (pct > 100) pct = 100;
+	if (!period || period == 0xFFFFFFFFu || period == 0xDEADBEEFu) return 0;
+	uint32_t d = (uint32_t)(((uint64_t)period * gXeBrGamma[pct]) >> 20);
+	return d < 1 ? 1 : d;
+}
+static uint32_t xeBrPctFromDuty(uint32_t duty, uint32_t period) {
+	if (!period) return 0;
+	uint64_t ratio = ((uint64_t)duty << 20) / period;
+	uint32_t best = 1;
+	for (uint32_t i = 1; i <= 100; i++) if (gXeBrGamma[i] <= ratio) best = i;
+	return best;
+}
+static void xeBrInitFromBootArg() {
+	static int done = 0;
+	if (done) return;
+	done = 1;
+	uint32_t b = 0;
+	if (PE_parse_boot_argn("ngreenbright", &b, sizeof(b)) && b >= 1 && b <= 100) gXeBrPct = b;
+}
+static int xeBrightnessProc(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	int v = 0;
+	auto *g = NGreen::callback;
+	if (g && g->isMmioReady()) {
+		if (gXeBrPct) v = (int)gXeBrPct;
+		else v = (int)xeBrPctFromDuty(g->readReg32(0xC8258), g->readReg32(0xC8254));
+	}
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err || !req->newptr) return err;
+	if (v < 1 || v > 100) return EINVAL;
+	if (!g || !g->isMmioReady()) return EAGAIN;
+	uint32_t ctl = g->readReg32(0xC8250), period = g->readReg32(0xC8254);
+	if (!(ctl & 0x80000000u)) { SYSLOG("ngreen", "brightness: PWM is off (CTL=0x%x), nothing changed", ctl); return ENXIO; }
+	uint32_t duty = xeBrDuty((uint32_t)v, period);
+	if (!duty) { SYSLOG("ngreen", "brightness: invalid PWM period 0x%x (AUX backlight?)", period); return EIO; }
+	gXeBrPct = (uint32_t)v;
+	g->writeReg32(0xC8258, duty);
+	return 0;
+}
+static char gXeBlRegsBuf[200];
+static int xeBacklightRegsProc(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req) {
+	auto *g = NGreen::callback;
+	if (g && g->isMmioReady())
+		snprintf(gXeBlRegsBuf, sizeof(gXeBlRegsBuf), "pch_ctl=%08x pch_freq=%08x pch_duty=%08x cpu_ctl2=%08x cpu_ctl=%08x pp_ctl=%08x pp_stat=%08x set_pct=%u",
+		         g->readReg32(0xC8250), g->readReg32(0xC8254), g->readReg32(0xC8258), g->readReg32(0x48250), g->readReg32(0x48254),
+		         g->readReg32(0xC7204), g->readReg32(0xC7200), (unsigned)gXeBrPct);
+	else
+		snprintf(gXeBlRegsBuf, sizeof(gXeBlRegsBuf), "mmio not ready");
+	return sysctl_handle_string(oidp, gXeBlRegsBuf, sizeof(gXeBlRegsBuf), req);
+}
+SYSCTL_PROC(_kern, OID_AUTO, xe_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0, xeBrightnessProc, "I",
+            "panel brightness in percent (1-100)");
+SYSCTL_PROC(_kern, OID_AUTO, xe_backlight_regs, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, xeBacklightRegsProc, "A",
+            "backlight PWM registers");
+static void xeBrightnessRegister() {
+	static bool done = false;
+	if (done) return;
+	done = true;
+	sysctl_register_oid(&sysctl__kern_xe_brightness);
+	sysctl_register_oid(&sysctl__kern_xe_backlight_regs);
+}
+
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 	xeBootDiagRecord(reg, val);
 	val = xeBootHold(reg, val);
@@ -3954,6 +4042,8 @@ static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
 					val = v > gBlHwFreq ? gBlHwFreq : (uint32_t)v;
 				}
 				gBlLastOut = val;
+				xeBrInitFromBootArg();
+				if (gXeBrPct) { uint32_t d = xeBrDuty(gXeBrPct, gBlHwFreq); if (d) val = d; gBlLastOut = val; }
 			}
 		}
 	}

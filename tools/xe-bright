@@ -1,0 +1,22 @@
+#!/bin/zsh
+# xe-bright: panel brightness through NootedGreen's kern.xe_brightness (PCH PWM backlight).
+#   xe-bright            print the level (%)
+#   xe-bright <1-100>    set it
+#   xe-bright + | -      one step up / down (16 steps, perceptual)
+#   xe-bright regs       dump the raw backlight registers (diagnostics)
+#   xe-bright save       remember the current level in ~/.xe-bright
+#   xe-bright restore    apply the remembered level (run it at login)
+set -e
+KEY=kern.xe_brightness
+cur() { sysctl -n $KEY 2>/dev/null || { echo "kern.xe_brightness is missing: NootedGreen with the brightness control is not loaded" >&2; exit 1; } }
+set_pct() { local v=$1; (( v < 1 )) && v=1; (( v > 100 )) && v=100; sysctl -w $KEY=$v >/dev/null 2>&1 || { echo "could not set $v (PWM off or invalid period: see 'xe-bright regs')" >&2; exit 1; }; print $v }
+case "${1:-}" in
+  "")      cur ;;
+  regs)    sysctl -n kern.xe_backlight_regs ;;
+  save)    cur > ~/.xe-bright ;;
+  restore) [[ -f ~/.xe-bright ]] && set_pct $(<~/.xe-bright) ;;
+  +)       set_pct $(( $(cur) + 100/16 )) ;;
+  -)       set_pct $(( $(cur) - 100/16 )) ;;
+  <->)     set_pct $1 ;;
+  *)       echo "usage: xe-bright [1-100 | + | - | regs | save | restore]" >&2; exit 2 ;;
+esac
