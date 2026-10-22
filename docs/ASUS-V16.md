@@ -141,3 +141,16 @@ the original bundle back. Result (`tools/diagnostics/gpu-tests/gl-probe.c`): `In
 GLSL 4.10, shaders compile and draw correct pixels. Only message: `setProvokingVertexMode: unsupported` (harmless).
 
 Both scripts need `sudo`. A macOS update may replace or invalidate the symlinks; rerun the script.
+
+
+## Java (Minecraft, Swing) crashed at the first safepoint / null check: libxedrv's crash handler
+
+Symptom: any Java program that created a Metal device (a Swing window, Minecraft) died with `EXC_BAD_ACCESS` in JIT code
+(`SIGSEGV` at 0x8/0xc, or `SIGBUS KERN_PROTECTION_FAILURE` on the safepoint polling page), `terminated by: exc handler`
+(the process itself), with no `hs_err` file. HotSpot uses faults on purpose (implicit null checks, safepoint polls) through
+its own `SIGSEGV`/`SIGBUS` handler. `libxedrv.dylib` (loaded by the Metal driver, after the JVM has started) replaced those
+handlers with its v9 crash logger and then reset them to `SIG_DFL`. Seen with an injected watcher that polls `sigaction`
+(`libjvm javaSignalHandler` -> `libxedrv crash_handler`). Fix in `macos/src/libxedrv.m` (v18): keep the previous handler of
+SIGSEGV/SIGBUS/SIGILL/SIGABRT and forward the fault to it; only log and reset when there was none. The installed library was
+built from v15 (commit 5b16356; v16 and v17 were never installed), so `tools/install-xedrv-fix.sh v15fix` installs v15 + only
+this fix and `v17fix` installs the current source with it. `tools/restore-xedrv.sh` undoes it. New processes pick it up.

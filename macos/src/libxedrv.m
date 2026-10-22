@@ -254,7 +254,20 @@ static BOOL install_rhm(void) {
 
 // v9: registrador de crash. Em SIGSEGV/SIGBUS/SIGABRT/SIGILL grava no log o endereço da falha, registradores e a pilha
 // simbolizada (imagem+offset+símbolo), depois devolve o sinal ao comportamento padrão (o processo morre como antes).
+//
+// v18 (24/10): NÃO pode tomar o lugar do tratador de quem já o instalou. A JVM (HotSpot) usa SIGSEGV/SIGBUS de propósito
+// (verificação de nulo implícita, ponto de safepoint) e instala o seu tratador antes de o Metal carregar este dylib. O v9
+// o substituía e depois punha SIG_DFL: todo processo Java que criava um dispositivo Metal (Swing/AWT, Minecraft) morria
+// no primeiro safepoint ou null check ("exc handler", SIGSEGV em código JIT). Agora guarda o tratador anterior e repassa
+// a falha a ele, sem registrar nem mexer no sinal; só trata sozinho quando não havia tratador anterior.
+static struct sigaction g_old_sa[32];
+static int g_old_sa_set[32];
 static void crash_handler(int sig, siginfo_t* si, void* uc_) {
+  if (sig > 0 && sig < 32 && g_old_sa_set[sig]) {
+    struct sigaction* o = &g_old_sa[sig];
+    if (o->sa_flags & SA_SIGINFO) { if (o->sa_sigaction) { o->sa_sigaction(sig, si, uc_); return; } }
+    else if (o->sa_handler != SIG_DFL && o->sa_handler != SIG_IGN) { o->sa_handler(sig); return; }
+  }
   ucontext_t* uc = (ucontext_t*)uc_;
   if (uc && uc->uc_mcontext) {
     _STRUCT_X86_THREAD_STATE64* r = &uc->uc_mcontext->__ss;
@@ -287,10 +300,18 @@ static void crash_handler(int sig, siginfo_t* si, void* uc_) {
 }
 static void install_crash(void) {
   struct sigaction sa; memset(&sa, 0, sizeof sa);
-  sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+  // sem SA_RESETHAND: com um tratador anterior para repassar, o nosso tem de continuar instalado para as próximas falhas;
+  // no caminho sem tratador anterior crash_handler já faz signal(sig, SIG_DFL) por conta própria.
+  sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO;
   sigemptyset(&sa.sa_mask);
   int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGABRT};
-  for (unsigned i = 0; i < 4; i++) sigaction(sigs[i], &sa, NULL);
+  for (unsigned i = 0; i < 4; i++) {
+    int sg = sigs[i];
+    struct sigaction old; memset(&old, 0, sizeof old);
+    if (sigaction(sg, &sa, &old) == 0 && old.sa_sigaction != (void*)SIG_DFL && old.sa_sigaction != (void*)SIG_IGN && old.sa_sigaction != (void*)crash_handler) {
+      g_old_sa[sg] = old; g_old_sa_set[sg] = 1;
+    }
+  }
 }
 
 // v12 (19/10): sem compressão de textura. O hang do RCS era um render-target FAST CLEAR (3DSTATE_PS com
