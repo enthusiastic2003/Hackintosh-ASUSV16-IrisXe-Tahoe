@@ -5570,6 +5570,50 @@ static void xeHangDumpBlock(const char *what, uint64_t gaddr, uint32_t dwords, u
 	}
 }
 
+// ===== Linux i915 Gen12 engine workarounds (opt-in: -ngreeni915wa) =====
+// Apple's 2020 Tiger Lake driver predates these. They are *engine* workarounds in i915 (plain MMIO writes after engine init/reset, not part of the
+// context image) and are all conditioned on ADL-P (RPL-P uses adl_p_info) in drivers/gpu/drm/i915/gt/intel_workarounds.c. The GPU hang reports
+// show the render engine stuck on a CS-stall PIPE_CONTROL with PSD/TDL/EUs not done; several of these target exactly that unit.
+// Masked registers take (bit << 16) | bit. MCR registers (0xe4f4, 0xe48c, 0xe18c, 0x9550) are written with the multicast selector as the
+// driver left it (checked, never changed). The worker re-asserts them every second so they survive a GPU restart.
+struct XeWaEntry { uint32_t reg; uint32_t bit; bool masked; bool mcr; const char *name; };
+static const XeWaEntry gXeWa[] = {
+	{0x20ec, 1u << 1,  true,  false, "CS_DEBUG_MODE1.FF_DOP_CLOCK_GATE_DISABLE (Wa_1606700617)"},
+	{0xe4f4, 1u << 14, true,  true,  "ROW_CHICKEN2.DISABLE_EARLY_READ (Wa_1606931601)"},
+	{0xe4f4, 1u << 8,  true,  true,  "ROW_CHICKEN2.PUSH_CONST_DEREF_HOLD_DIS (Wa_1409804808)"},
+	{0xe48c, 1u << 9,  true,  true,  "ROW_CHICKEN4.DISABLE_TDL_PUSH (Wa_14010229206)"},
+	{0xe18c, 1u << 15, true,  true,  "SAMPLER_MODE.ENABLE_SMALLPL (Wa_1406941453)"},
+	{0x20a0, 1u << 19, false, false, "FF_THREAD_MODE.TESSELATION_DOP_GATE_DISABLE (Wa_14010919138)"},
+	{0x9550, 1u << 9,  false, true,  "DFR_RATIO_EN_AND_CHICKEN.DFR_DISABLE (Wa_14011059788)"},
+};
+static int xeWaOn = -1;
+static bool xeWaLogged = false;
+static uint32_t xeWaReapplied = 0;
+
+// Called from the 1 Hz worker with the render forcewake held. First call logs the values Apple left (before touching anything).
+static void xeI915Wa(NGreen *g) {
+	if (xeWaOn < 0) xeWaOn = checkKernelArgument("-ngreeni915wa") ? 1 : 0;
+	bool mcrMulticast = (g->readReg32(0xfdc) & 0x80000000u) != 0;
+	if (!xeWaLogged) {
+		xeWaLogged = true;
+		SYSLOG("ngreen", "i915wa: opt-in %s; MCR_SELECTOR=%08x (multicast=%d). Values left by Apple's driver:", xeWaOn ? "ON" : "off (-ngreeni915wa to enable)",
+		       g->readReg32(0xfdc), mcrMulticast);
+		for (auto &e : gXeWa)
+			SYSLOG("ngreen", "i915wa:   %-62s reg %05x = %08x -> bit %s", e.name, e.reg, g->readReg32(e.reg), (g->readReg32(e.reg) & e.bit) ? "already set" : "NOT set");
+		SYSLOG("ngreen", "i915wa:   MISCCPCTL(9424)=%08x (Wa_14015795083 wants bit1 clear)", g->readReg32(0x9424));
+	}
+	if (!xeWaOn) return;
+	for (auto &e : gXeWa) {
+		if (e.mcr && !mcrMulticast) continue;   // never change the steering selector; skip if it is not multicast
+		uint32_t before = g->readReg32(e.reg);
+		if (before & e.bit) continue;
+		g->writeReg32(e.reg, e.masked ? ((e.bit << 16) | e.bit) : (before | e.bit));
+		uint32_t after = g->readReg32(e.reg);
+		if (xeWaReapplied++ < 24)
+			SYSLOG("ngreen", "i915wa: applied %s: %08x -> %08x%s", e.name, before, after, (after & e.bit) ? "" : "  (DID NOT STICK)");
+	}
+}
+
 static void xeHangWatchWorker(thread_call_param_t, thread_call_param_t) {
 	auto *g = NGreen::callback;
 	if (g && g->isMmioReady()) {
@@ -5583,7 +5627,7 @@ static void xeHangWatchWorker(thread_call_param_t, thread_call_param_t) {
 		if (pending && head == xeHwHead && acthd == xeHwActhd) xeHwStuck++;
 		else { xeHwStuck = 0; xeHwHeld = 0; }
 		xeHwHead = head; xeHwActhd = acthd;
-		if (xeHwStuck >= 3 && !xeHwHeld && xeHwDumps < 6) {
+		if (xeHwStuck >= 2 && !xeHwHeld && xeHwDumps < 6) {
 			xeHwHeld = 1;
 			uint32_t n = ++xeHwDumps;
 			uint32_t start = rd(B + 0x38);
@@ -5594,11 +5638,14 @@ static void xeHangWatchWorker(thread_call_param_t, thread_call_param_t) {
 			       rd(B + 0x550), rd(B + 0x3a0), rd(B + 0x9c), rd(B + 0x29c));
 			SYSLOG("ngreen", "HANGWATCH#%u: ERROR_GEN6=%08x GDRST=%08x SC_INSTDONE=%08x SC_INSTDONE_EXTRA=%08x CS_DEBUG_MODE1=%08x CS_CHICKEN1=%08x",
 			       n, rd(0x40a0), rd(0x941c), rd(0x7100), rd(0x7104), rd(B + 0xec), rd(0x2580));
+			SYSLOG("ngreen", "HANGWATCH#%u: WA regs: 20ec=%08x 20a0=%08x e4f4=%08x e48c=%08x e18c=%08x 9550=%08x 9424=%08x i915wa=%d", n,
+			       rd(0x20ec), rd(0x20a0), rd(0xe4f4), rd(0xe48c), rd(0xe18c), rd(0x9550), rd(0x9424), xeWaOn);
 			uint64_t bb = (uint64_t)(acthd & ~3u);
 			xeHangDumpBlock("BATCH", bb >= 256 ? bb - 256 : 0, 128, bb);                        // 64 dwords before ACTHD, 64 after
 			uint64_t rg = (uint64_t)start + (head >= 128 ? head - 128 : 0);
 			xeHangDumpBlock("RING ", rg, 64, (uint64_t)start + head);
 		}
+		xeI915Wa(g);
 		g->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17));   // drop our reference (clear bit 1 only)
 	}
 	if (xeHwTc) {
