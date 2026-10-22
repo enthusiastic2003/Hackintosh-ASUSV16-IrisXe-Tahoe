@@ -363,6 +363,7 @@ static void xeDispStamp(void *that, int idx, uint32_t stamp) {
 static mach_vm_address_t gOrgS5Push = 0, gOrgS5Notify = 0, gOrgCs5Submit = 0, gOrgS5Pause = 0, gOrgS5Resume = 0;
 static volatile uint32_t gS5PushN = 0, gS5NotifyN = 0, gCs5SubmitN = 0, gS5PauseN = 0, gS5ResumeN = 0;
 static uint32_t gThrtN = 0, gThrtSimN = 0;
+static volatile uint32_t gCsbResyncN = 0;  // 21/10: active->idle salvos pelo xeCsbResync (CSBR)
 static volatile uint32_t gCsbSkipN = 0;  // 19/10: eventos active->idle descartados pelo xeCsbA2I
 // 20/10: brilho (PWM sul 0xC8254 período / 0xC8258 duty), estilo BacklightRegistersFix do WhateverGreen
 static volatile uint32_t gBlHwFreq = 0, gBlAppleFreq = 0, gBlLastDuty = 0, gBlMaxDuty = 0, gBlLastOut = 0, gBlFreqWrites = 0;
@@ -422,8 +423,9 @@ static void xeCsStateWorker(thread_call_param_t, thread_call_param_t) {
 			  c[0x1c00], *reinterpret_cast<volatile uint32_t *>(c + 0x1c38), c[0x1c3c]);
 	}
 	if (gAccelObj && tick % 8 == 0)
-		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
-			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut);
+		IOLog("XeNG CS t=%u dpsm1458=0x%x cfg1190=0x%x (push %u exec %u) thrt=%u thrtSim=%u csbx=%u csbr=%u idlw=%u/%llums max=%uus to=%u pgoff=%u pgon=%u pgfix=%u stail=%u resfix=%u orf=%u dpms=%u fbdpms=%u gtf=%u/0x%x bl hw=%u apple=%u fw=%u duty=%u max=%u out=%u rc1474=%u\n", tick, *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1458),
+			  *reinterpret_cast<volatile uint32_t *>(gAccelObj + 0x1190), gS5PushN, gCs5SubmitN, gThrtN, gThrtSimN, gCsbSkipN, gCsbResyncN, gIdlwN, (unsigned long long)(gIdlwUs / 1000), gIdlwMax, gIdlwTimeout, gPageoffN, gPageonN, gPageonFix, gSameTailForced, gXeResFreeFix, gXeOrphanMiss, gXeDpmsBlocked, gXeFbDpmsN, gXeGtFreqN, gXeGtFreqApple, gBlHwFreq, gBlAppleFreq, gBlFreqWrites, gBlLastDuty, gBlMaxDuty, gBlLastOut,
+			  (unsigned)*reinterpret_cast<volatile uint8_t *>(gAccelObj + 0x1474));
 	if (tick < 2400 && gCsStateTc) {  // a cada 250 ms por ~10 min
 		uint64_t deadline;
 		clock_interval_to_deadline(250, kMillisecondScale, &deadline);
@@ -662,6 +664,34 @@ static bool xeMapeado(uint64_t va) {
 	void *kp = *reinterpret_cast<void **>(gKernelPmap);
 	return reinterpret_cast<uint32_t (*)(void *, uint64_t)>(gPmapFindPhys)(kp, va) != 0;
 }
+// xe/vadiag (21/10, default on, -ngreennovadiag disables): hardware video decode returned empty frames. Every decode submission is
+// "dropped on floor" by IOAccelFIFOChannel2::submitCommands because IGAccelVideoContext::bind_resource clears
+// info.valid (+0x3c) for the FIRST relocation it binds (any handle; user-space bisect). This hook only classifies the
+// failure, no behaviour change: *addr/*pitch get sentinels before the original call:
+//   res==0                    -> IOAccelContext2::lookupResource failed (handle not in the IOAccelShared2 namespace)
+//   res!=0, addr==sentinel    -> IOAccelContext2::bindResource failed (Tahoe: write check on accel+0xc90 bit 30 /
+//                                res+0xd bit 1, or IOAccelResource2::prepare() -> map()/memory map list)
+//   addr set, pitch==0        -> IGAccelResource::get_tex_data found no plane/size (resource layout/type)
+// Logs the first 48 failures and counts all of them (gVaBindFail/gVaBindOk).
+static mach_vm_address_t gOrgVaBind = 0;
+static uint32_t gVaBindFail = 0, gVaBindOk = 0;
+static bool xeVaBind(void *that, void *info, uint32_t handle, void **res, uint64_t *addr, uint32_t *pitch, bool write) {
+	auto *inf = static_cast<uint8_t *>(info);
+	uint8_t validBefore = inf ? inf[0x3c] : 0xff;
+	if (addr) *addr = 0xdeadbeefdeadbeefULL;
+	if (pitch) *pitch = 0xdeadbeef;
+	bool r = FunctionCast(xeVaBind, gOrgVaBind)(that, info, handle, res, addr, pitch, write);
+	if (r) { gVaBindOk++; return r; }
+	if (gVaBindFail++ < 48) {
+		auto *rs = (res && *res) ? static_cast<uint8_t *>(*res) : nullptr;
+		const char *why = !rs ? "lookup" : (addr && *addr == 0xdeadbeefdeadbeefULL) ? "bindResource/prepare" : (pitch && *pitch == 0) ? "get_tex_data pitch=0" : "other";
+		IOLog("XeNG VADIAG bind fail #%u: h=%#x w=%d valid %u->%u why=%s res=%p type=%#x f0d=%#x f0e=%#x prep=%u map=%p addr=%#llx pitch=%#x (ok=%u)\n",
+		      gVaBindFail, handle, write, validBefore, inf ? inf[0x3c] : 0xff, why, rs, rs ? rs[0x14] : 0, rs ? rs[0xd] : 0, rs ? rs[0xe] : 0,
+		      rs ? *reinterpret_cast<uint32_t *>(rs + 0x28) : 0, rs ? *reinterpret_cast<void **>(rs + 0x40) : nullptr,
+		      addr ? (unsigned long long)*addr : 0ULL, pitch ? *pitch : 0, gVaBindOk);
+	}
+	return r;
+}
 static void xePageon(void *that, void *ev, bool b, uint64_t x) {
 	if (xeNoPaging()) { gPageonN++; return; }
 	static int guard = -1;
@@ -705,8 +735,37 @@ static bool xeCsbEventoInvalido(void *that, const uint32_t *e, bool exigeEl1, ui
 	}
 	return false;
 }
+// xe/csbresync (21/10): hang do WindowServer (antes do login e após troca de modo/DPI). Em todo travamento o
+// CSBX descartou o "active->idle" REAL de um contexto curto (~200 us após o EXEC): o "idle->active" correspondente
+// não foi processado, então o elemento ficou no slot pendente (1-cur) e EL[cur] estava vazio. Descartar deixa a
+// execlist "ocupada" para sempre com a GPU ociosa (EXECLIST_STATUS 0x18001): o stamp nunca anda, o IOAF chama
+// eventTimeout -> checkForProgress (3,3 s) -> getActiveContexts vazio -> "GPURestartSkipped / no channel" a cada 5 s.
+// Em vez de descartar: se EL[cur] está vazio e o slot pendente tem exatamente esse contexto, sintetiza o
+// idle->active que faltou (csbProcessIdleToActive original: troca cur e limpa o slot velho) e processa o evento.
+// Eventos realmente repetidos/atrasados (nenhum slot bate) continuam descartados. -ngreennocsbresync desliga.
+static mach_vm_address_t gOrgCsbI2A = 0;  // só resolvido, não roteado
+static bool xeCsbResync(void *that, const uint32_t *e) {
+	static int on = -1;
+	if (on < 0) on = checkKernelArgument("-ngreennocsbresync") ? 0 : 1;
+	if (on != 1 || !gOrgCsbI2A || !that || !e) return false;
+	auto *cs = static_cast<uint8_t *>(that);
+	uint32_t idx = *reinterpret_cast<uint32_t *>(cs + 0x50);
+	if (idx > 1) return false;
+	uint32_t pend = 1 - idx;
+	auto *elCur = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)idx * 16);
+	auto *elPend = *reinterpret_cast<uint8_t **>(cs + 0x30 + (uint64_t)pend * 16);
+	auto *ctxPend = elPend ? *reinterpret_cast<uint8_t **>(elPend) : nullptr;
+	uint32_t id = (e[1] >> 5) & 0x7ff;
+	if (elCur || !ctxPend || *reinterpret_cast<uint32_t *>(ctxPend + 0x7c) != id) return false;
+	reinterpret_cast<void (*)(void *, const uint32_t *)>(gOrgCsbI2A)(that, e);  // não lê 'e'; cur := pend
+	xeEv('CSBR', idx, id, ++gCsbResyncN);
+	return true;
+}
 static void xeCsbA2I(void *that, const uint32_t *e) {
-	if (xeCsbEventoInvalido(that, e, false, 'CSBX')) return;
+	if (xeCsbEventoInvalido(that, e, false, 'CSBX')) {
+		if (!xeCsbResync(that, e)) return;
+		if (xeCsbEventoInvalido(that, e, false, 'CSBY')) return;  // não deveria acontecer
+	}
 	FunctionCast(xeCsbA2I, gOrgCsbA2I)(that, e);
 }
 static void xeCsbPreempt(void *that, const uint32_t *e) {
@@ -1879,6 +1938,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			 {"__ZN15IGAccelResource4freeEv", IGAccelResourcefree, this->oIGAccelResourcefree},
 			 // 20/10 (XE-GTFREQ): sem GuC o pedido de frequência da Apple é sempre 0 -> GPU presa em 100 MHz.
 			 {"__ZN26IGHardwareCommandStreamer518setGTFrequencyMMIOEj", wrapSetGTFrequencyMMIO, this->oSetGTFrequencyMMIO},
+			 // 21/10 (XE-IDLEBOUND): IGScheduler5::waitForGpuIdle (stopGraphicsEngine no desligamento) espera até 25000 x 100 us.
+			 {"__ZN12IGScheduler514waitForGpuIdleEv", wrapWaitForGpuIdle, this->oWaitForGpuIdle},
 			 // V143: Register operator new for IGHardwareBlit3DContext so getBlit3DContext can
 			 // actually allocate the context object. Without this, oIGHardwareBlit3DContextoperatornew
 			 // is always null → alloc always returns nullptr → ctx=0 forever → NULL-task submitBlit
@@ -1974,6 +2035,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 				{"__ZN17IGHardwareContext20restoreFromSafeImageEv", xeRestoreSafe, gOrgRestoreSafe},
 			};
 			SolveRequestPlus poshSolve[] = {{"__ZNK20IGSharedMappedBuffer17getVirtualAddressEv", gSmbGetVA}};
+			SolveRequestPlus csbI2ASolve[] = {{"__ZN26IGHardwareCommandStreamer522csbProcessIdleToActiveEPK28SGfxContextStatusBufferEntry", gOrgCsbI2A}};
+			if (!SolveRequestPlus::solveAll(patcher, index, csbI2ASolve, address, size)) { patcher.clearError(); gOrgCsbI2A = 0; }
+			IOLog("XeNG CSBRESYNC: idleToActive=%s\n", gOrgCsbI2A ? "ok" : "NAO");
 			gPmapFindPhys = patcher.solveSymbol(KernelPatcher::KernelID, "_pmap_find_phys");
 			if (!gPmapFindPhys) patcher.clearError();
 			gKernelPmap = patcher.solveSymbol(KernelPatcher::KernelID, "_kernel_pmap");
@@ -1984,6 +2048,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			bool okr = RouteRequestPlus::routeAll(patcher, index, ringDiag, address, size);
 			if (!okr) patcher.clearError();
 			IOLog("XeNG RING diag hooks: %s\n", okr ? "OK" : "FALHOU");
+			if (!checkKernelArgument("-ngreennovadiag")) {  // log-only, default on (boot-args are near the 228-char limit)
+				RouteRequestPlus vaDiag[] = {{"__ZN19IGAccelVideoContext13bind_resourceER24IOAccelCommandStreamInfojPP15IGAccelResourcePyPjb", xeVaBind, gOrgVaBind}};
+				bool okv = RouteRequestPlus::routeAll(patcher, index, vaDiag, address, size);
+				if (!okv) patcher.clearError();
+				IOLog("XeNG VADIAG: bind_resource hook %s\n", okv ? "OK" : "FALHOU");
+			}
 			bool ok = RouteRequestPlus::routeAll(patcher, index, flipDiag, address, size);
 			if (!ok) patcher.clearError();
 			IOLog("XeNG FLIP diag hooks: %s\n", ok ? "OK" : "FALHOU");
@@ -2458,6 +2528,56 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					LookupPatchPlus const patchNoAux[] = {{activeKext, f_noaux, r_noaux, arrsize(f_noaux), 1}};
 					bool oka = LookupPatchPlus::applyAll(patcher, patchNoAux, address, size);
 					IOLog("XeNG NOAUX: fillSurfaceStateAuxInfo sempre AUX_NONE: %s\n", oka ? "aplicado" : "NAO encontrado");
+				}
+				// xe/rcpolicy (21/10, from WhateverXe jkbuha 1a9b960/76a9459): IntelAccelerator+0x1474 is the display/IOSurface
+				// "renderCompression" policy. start() leaves it 0 on real hardware (it is 1 only in the simulator), but the TGL
+				// FB's setDisplayMode calls callPlatformFunction("renderCompression", !hasExternalDisplay()) when the YTiling
+				// feature is on (FeatureControl YTiling=1 here) -> 1 with the internal panel only. XE-NOCCS's properties do not
+				// touch it. With 1: calculateIOSurfaceDeviceCacheVRAMBytes reserves CCS space for IOSurfaces, flips may keep a
+				// compressed scanout and generateFlip may set PLANE_CTL bit 15 (render decompression) although AUX is forced
+				// NONE (XE-NOAUX) and the resolves are stubbed (NOCCS3/NODEPTH). With 0 the accelerator runs Apple's
+				// "external display connected" path: every flip goes through disableRenderCompression first.
+				// Startup immediate (0x246e0) 1->0 and the setter (0x2b872) "mov al,[r15]" -> "mov al,0; nop".
+				// -ngreennorc disables.
+				if (xeFixEnabled() && !checkKernelArgument("-ngreennorc")) {
+					static const uint8_t f_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x01};
+					static const uint8_t r_rcstart[] = {0x41, 0xf6, 0x06, 0x20, 0x74, 0x08, 0x41, 0xc6, 0x85, 0x74, 0x14, 0x00, 0x00, 0x00};
+					static const uint8_t f_rcset[] = {0x41, 0x8a, 0x07, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					static const uint8_t r_rcset[] = {0xb0, 0x00, 0x90, 0x41, 0x88, 0x86, 0x74, 0x14, 0x00, 0x00, 0xeb, 0x16};
+					LookupPatchPlus const patchRcStart[] = {{activeKext, f_rcstart, r_rcstart, arrsize(f_rcstart), 1}};
+					LookupPatchPlus const patchRcSet[] = {{activeKext, f_rcset, r_rcset, arrsize(f_rcset), 1}};
+					bool oks = LookupPatchPlus::applyAll(patcher, patchRcStart, address, size);
+					if (!oks) patcher.clearError();
+					bool okr = LookupPatchPlus::applyAll(patcher, patchRcSet, address, size);
+					if (!okr) patcher.clearError();
+					IOLog("XeNG RCPOLICY: renderCompression (accel+0x1474) sempre 0: start %s, setter %s\n",
+						  oks ? "aplicado" : "NAO encontrado", okr ? "aplicado" : "NAO encontrado");
+				}
+				// xe/ffdop + xe/objpreempt (21/10, opt-in; WhateverXe r145/r135): IntelAccelerator::startGraphicsEngine writes
+				// CS_DEBUG_MODE1 (0x20ec) = 0x10001 and feeds the same EDX into CS_CHICKEN1 (0x2580). Our V163/V164 already
+				// clear FF_SLICE_CS_CHICKEN1 bit 14, so 3D object-level preemption is selected by 0x20ec bit 0 (=1 today).
+				//   -ngreenffdop        : also set 0x20ec bit 1 FF_DOP_CLOCK_GATE_DISABLE (Linux Wa_1606700617 tgl/dg1/adl-p).
+				//   -ngreenobjpoff: clear bit 0 in 0x20ec and 0x2580 (object-level preemption off; WEX TGL-B0 erratum).
+				// Window at 0x25166 (16.0.32): "mov edx,[rax+0x20ec]; mov edx,0x10001; mov [rax+0x20ec],edx" becomes
+				// "mov edx,<20ec>; mov [rax+0x20ec],edx; mov edx,<2580 bits>; nop" (the discarded MMIO read goes away).
+				{
+					bool ffdop = checkKernelArgument("-ngreenffdop");
+					bool objoff = checkKernelArgument("-ngreenobjpoff");
+					if (ffdop || objoff) {
+						uint8_t v20ec = (ffdop ? 0x02 : 0x00) | (objoff ? 0x00 : 0x01);
+						uint8_t m20ec = 0x01 | (ffdop ? 0x02 : 0x00);
+						uint8_t v2580 = objoff ? 0x00 : 0x01;
+						static const uint8_t f_preempt[] = {0x8b, 0x90, 0xec, 0x20, 0x00, 0x00, 0xba, 0x01, 0x00, 0x01, 0x00,
+						                                    0x89, 0x90, 0xec, 0x20, 0x00, 0x00};
+						uint8_t r_preempt[] = {0xba, v20ec, 0x00, m20ec, 0x00, 0x89, 0x90, 0xec, 0x20, 0x00, 0x00,
+						                       0xba, v2580, 0x00, 0x01, 0x00, 0x90};
+						static_assert(sizeof(r_preempt) == sizeof(f_preempt), "preempt patch size");
+						LookupPatchPlus const patchPreempt[] = {{activeKext, f_preempt, r_preempt, arrsize(f_preempt), 1}};
+						bool okp = LookupPatchPlus::applyAll(patcher, patchPreempt, address, size);
+						if (!okp) patcher.clearError();
+						IOLog("XeNG PREEMPT: 0x20ec=0x%02x%04x 0x2580|=0x1%04x (ffdop=%d objoff=%d): %s\n", m20ec, v20ec, v2580,
+							  ffdop, objoff, okp ? "aplicado" : "NAO encontrado");
+					}
 				}
 
 				// Optional secondary signature for Sonoma variants with long JE encoding.
@@ -3682,7 +3802,134 @@ static uint32_t xeNoDpms(uint32_t r, uint32_t val) {
 	gXeDpmsBlocked++;   // sem IOLog: este filtro roda dentro de seções travadas do FB (log aqui = deadlock/spinlock timeout)
 	return r == 0xC7204 ? (val | 1u) : lastOn[idx];   // painel: só força o power on, o resto (backlight) passa
 }
+// xe/bootbar (21/10). XE-BOOTDIAG (só log, limitado): anel com as escritas da Apple no plano A, FBC, PSR, PIPE_SRCSZ
+// e DC_STATE_EN (sem log no caminho de escrita: pode ser contexto de interrupção), impresso com um retrato dos
+// registradores e do console do kernel antes/depois do FBController::start, em cada setDisplayMode e em +10/+40 s.
+// XE-BOOTHOLD: no boot o plano A varre o buffer linear 1024x768 da GOP em GGTT 0 (SURF=0). No 1º modo (~t=20.7 s) a
+// Apple grava PLANE_CTL X-tiled, STRIDE 0x1e, SIZE/PIPESRC 3840x2400 mas mantém SURF=0 por ~1 s até ter o buffer
+// próprio (SURF=0x45beb000 em t=21.69) -> a tela mostra o buffer de boot lido como X-tiled 3840x2400 (flash de lixo
+// em colunas). Enquanto SURF ainda é 0 e a Apple pede CTL tiled, o plano fica DESLIGADO (tela preta); na 1ª SURF != 0
+// v3 (bootbar4): espera a SURF voltar a um buffer já visto (anel do WindowServer deu a volta); timeout de 500 ms após a 1ª.
+// Grava-se o CTL real antes da SURF (que arma os dois). -xenobb desliga.
+static volatile SInt32 gXeBhDone = 0, gXeBhHolding = 0, gXeBhOn = -1;
+static volatile UInt32 gXeBhCtl = 0, gXeBhFirst = 0;
+static volatile UInt32 gXeBhBlc = 0; static uint64_t gXeBhFirstNs = 0; static int gXeBhMinMs = 600, gXeBhMaxMs = 1500;
+struct XeBdEnt { uint64_t ns; uint32_t reg, val, old; };
+static XeBdEnt gXeBd[256];
+static volatile SInt32 gXeBdN = 0, gXeBdPrinted = 0;
+static bool xeBdWatched(uint32_t r) {
+	switch (r) {
+		case 0x43200: case 0x43208: case 0x43224: case 0x45000: case 0x4208c:         // FBC: CFB base, DPFC_CTL, chicken, chicken par
+		case 0x70180: case 0x70188: case 0x7018C: case 0x70190: case 0x7019C: case 0x701A4:  // plane A CTL/STRIDE/POS/SIZE/SURF/OFFSET
+		case 0x6001C: case 0x60800: case 0x60900:                                     // PIPE_SRCSZ, PSR1/PSR2 CTL
+		case 0x45504:                                                                 // DC_STATE_EN
+			return true;
+	}
+	return false;
+}
+static void xeBootDiagRecord(unsigned long reg, uint32_t val) {
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (!xeBdWatched(r)) return;
+	SInt32 i = OSIncrementAtomic((volatile SInt32 *)&gXeBdN);
+	if (i >= (SInt32)arrsize(gXeBd)) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	gXeBd[i].ns = ns; gXeBd[i].reg = r; gXeBd[i].val = val;
+	gXeBd[i].old = NGreen::callback ? NGreen::callback->readReg32(r) : 0xFFFFFFFF;
+}
+static void xeBootDiagDump(const char *tag) {
+	if (!NGreen::callback) return;
+	static int dumps = 0;
+	if (dumps++ >= 12) return;
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	PE_Video v {};
+	IOPlatformExpert *pe = OSDynamicCast(IOPlatformExpert, IOService::getPlatform());
+	bool hv = pe && pe->getConsoleInfo(&v) == kIOReturnSuccess;
+	#define R(a) NGreen::callback->readReg32(a)
+	IOLog("XeNG BOOTDIAG %s t=%llu.%03llu console=%d base=0x%lx rowBytes=%lu %lux%lu depth=%lu disp=%lu\n", tag,
+		  ns / 1000000000ULL, (ns / 1000000ULL) % 1000ULL, (int)hv, (unsigned long)v.v_baseAddr, (unsigned long)v.v_rowBytes,
+		  (unsigned long)v.v_width, (unsigned long)v.v_height, (unsigned long)v.v_depth, (unsigned long)v.v_display);
+	IOLog("XeNG BOOTDIAG %s PLANE_A CTL=%08x STRIDE=%08x POS=%08x SIZE=%08x SURF=%08x SURFLIVE=%08x OFF=%08x SRCSZ=%08x CUR=%08x/%08x\n", tag,
+		  R(0x70180), R(0x70188), R(0x7018C), R(0x70190), R(0x7019C), R(0x701AC), R(0x701A4), R(0x6001C), R(0x70080), R(0x70084));
+	IOLog("XeNG BOOTDIAG %s FBC CTL=%08x CFB=%08x CHICKEN=%08x STATUS=%08x/%08x PAR1=%08x 4208c=%08x PSR=%08x PSR2=%08x DC=%08x CDCLK_CTL=%08x DE_PLL=%08x\n", tag,
+		  R(0x43208), R(0x43200), R(0x43224), R(0x43210), R(0x43214), R(0x45000), R(0x4208c), R(0x60800), R(0x60900), R(0x45504), R(0x46000), R(0x46070));
+	for (int f = 0; f < 32; f++) {   // fences (aperture detiling used by CPU writes to tiled surfaces)
+		uint32_t lo = R(0x100000 + 8 * f), hi = R(0x100004 + 8 * f);
+		if (lo & 1) IOLog("XeNG BOOTDIAG %s FENCE%d lo=%08x hi=%08x\n", tag, f, lo, hi);
+	}
+	#undef R
+	SInt32 n = gXeBdN; if (n > (SInt32)arrsize(gXeBd)) n = arrsize(gXeBd);
+	for (SInt32 i = gXeBdPrinted; i < n; i++)
+		IOLog("XeNG BOOTDIAG w#%d t=%llu.%03llu reg=%05x val=%08x (was %08x)\n", (int)i, gXeBd[i].ns / 1000000000ULL,
+			  (gXeBd[i].ns / 1000000ULL) % 1000ULL, gXeBd[i].reg, gXeBd[i].val, gXeBd[i].old);
+	gXeBdPrinted = n;
+	IOLog("XeNG BOOTDIAG %s boothold blc0=%08x min=%d max=%d on=%d holding=%d done=%d ctl=%08x first=%08x\n", tag, (unsigned)gXeBhBlc, gXeBhMinMs, gXeBhMaxMs, (int)gXeBhOn, (int)gXeBhHolding, (int)gXeBhDone, (unsigned)gXeBhCtl, (unsigned)gXeBhFirst);
+	if (gXeBdN > (SInt32)arrsize(gXeBd)) IOLog("XeNG BOOTDIAG %s ring full (%d writes)\n", tag, (int)gXeBdN);
+}
+
+static thread_call_t gXeBhTimer = nullptr;
+static void xeBootHoldRelease(const char *why) {   // write Apple's last CTL, re-arm with the current SURF, backlight back on
+	if (gXeBhDone) return;
+	gXeBhDone = 1;
+	if (gXeBhHolding && NGreen::callback) {
+		NGreen::callback->writeReg32(0x70180, gXeBhCtl);
+		if (why) NGreen::callback->writeReg32(0x7019C, NGreen::callback->readReg32(0x7019C));
+		if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, NGreen::callback->readReg32(0xC8250) | 0x80000000u);
+	}
+	gXeBhHolding = 0;
+}
+static void xeBootHoldInit() {   // thread context (FBController::start): timer for the safety release
+	if (!gXeBhTimer) gXeBhTimer = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+		if (!gXeBhDone) { xeBootHoldRelease("timeout"); IOLog("XeNG BOOTHOLD: released by timeout %d ms (first SURF 0x%x)\n", gXeBhMaxMs, (unsigned)gXeBhFirst); }
+	}, nullptr);
+}
+// XE-BOOTHOLD v4 (bootbar5): as v3, plus backlight (BLC_PWM_PCH_CTL1 0xC8250 bit 31) off during the hold and release
+// only after the ring wrapped AND >= xebbms (default 600) ms since the first surface; timeout xebbms+900 ms.
+// v3: the first show of EACH buffer of WindowServer's ring is unrendered (garbage), so the plane stays off
+// until a SURF returns to a buffer already shown (ring wrapped); 500 ms after the first non-zero SURF it is released anyway.
+static uint32_t xeBootHold(unsigned long reg, uint32_t val) {
+	if (gXeBhDone) return val;
+	uint32_t r = (uint32_t)(reg & 0xFFFFF);
+	if (r == 0xC8250) {   // Apple re-enabling the backlight during the hold: remember it, keep it off until release
+		if (gXeBhHolding) { gXeBhBlc = val; return val & ~0x80000000u; }
+		return val;
+	}
+	if (r != 0x70180 && r != 0x7019C) return val;
+	if (gXeBhOn < 0) gXeBhOn = checkKernelArgument("-xenobb") ? 0 : 1;
+	if (!gXeBhOn || !NGreen::callback) { gXeBhDone = 1; return val; }
+	if (r == 0x70180) {
+		if (!(val & 0x80000000u)) return val;
+		bool start = !gXeBhHolding && NGreen::callback->readReg32(0x7019C) == 0 && (val & (0x7u << 10));  // tiled CTL on the boot buffer
+		if (start) {   // v4: also switch the backlight off for the whole hold (hides anything not coming from plane A)
+			PE_parse_boot_argn("xebbms", &gXeBhMinMs, sizeof(gXeBhMinMs));
+			if (gXeBhMinMs < 0 || gXeBhMinMs > 5000) gXeBhMinMs = 600;
+			gXeBhMaxMs = gXeBhMinMs + 900;
+			gXeBhBlc = NGreen::callback->readReg32(0xC8250);
+			if (gXeBhBlc & 0x80000000u) NGreen::callback->writeReg32(0xC8250, gXeBhBlc & ~0x80000000u);
+		}
+		if (start || gXeBhHolding) { gXeBhCtl = val; gXeBhHolding = 1; return val & ~0x80000000u; }
+		return val;
+	}
+	if (val == 0) return val;
+	if (!gXeBhHolding) { gXeBhDone = 1; return val; }               // never held: nothing to do
+	static uint32_t seen[8], nseen = 0, last = 0;
+	if (!gXeBhFirst) {                                              // first real surface: keep off, start the safety timer
+		gXeBhFirst = val; absolutetime_to_nanoseconds(mach_absolute_time(), &gXeBhFirstNs);
+		if (gXeBhTimer) { uint64_t d; clock_interval_to_deadline(gXeBhMaxMs, kMillisecondScale, &d); thread_call_enter_delayed(gXeBhTimer, d); }
+	}
+	if (val == last) return val;                                    // same buffer re-armed in the same flip
+	last = val;
+	for (uint32_t k = 0; k < nseen; k++)
+		if (seen[k] == val) {   // ring wrapped (every buffer rendered once) AND >= xebbms since the first surface
+			uint64_t now = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+			if (now - gXeBhFirstNs >= (uint64_t)gXeBhMinMs * 1000000ULL) xeBootHoldRelease(nullptr);   // CTL first, this SURF arms both
+			return val;
+		}
+	if (nseen < 8) seen[nseen++] = val;
+	return val;
+}
 static uint32_t xeFixFilterWrite(unsigned long reg, uint32_t val) {
+	xeBootDiagRecord(reg, val);
+	val = xeBootHold(reg, val);
 	if (!xeFixEnabled()) return val;
 	val = xeNoDpms((uint32_t)(reg & 0x1FFFFF), val);
 	// 20/10 (XE-BLR): o brilho ia só até ~50%. Como o BacklightRegistersFix do WhateverGreen: mantém o período do
@@ -4867,8 +5114,21 @@ bool Gen11::AppleIntelBaseControllerstart(AppleIntel::AppleIntelBaseController *
 	SYSLOG("ngreen", "AppleIntelBaseControllerstart: display workarounds applied");
 
 	SYSLOG("ngreen", "FBController::start() entering...");
+	xeBootHoldInit();
+	xeBootDiagDump("pre-FBstart");
 	auto ret=FunctionCast(AppleIntelBaseControllerstart, callback->oAppleIntelBaseControllerstart)(that,param_1 );
 	SYSLOG("ngreen", "FBController::start() returned %d", ret);
+	xeBootDiagDump("post-FBstart");
+	{   // again 10 s and 40 s later (thread context): writes made while the boot screen/progress bar were up and at the WindowServer handoff
+		static thread_call_t tc10 = nullptr, tc40 = nullptr;
+		if (!tc10) {
+			tc10 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+10s"); }, nullptr);
+			tc40 = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { xeBootDiagDump("t+40s"); }, nullptr);
+			uint64_t d10, d40; clock_interval_to_deadline(10, kSecondScale, &d10); clock_interval_to_deadline(40, kSecondScale, &d40);
+			if (tc10) thread_call_enter_delayed(tc10, d10);
+			if (tc40) thread_call_enter_delayed(tc40, d40);
+		}
+	}
 	
 	if (ret) {
 		// The personality dict itself was registered in IOCatalogue from the HW-kext
@@ -5309,6 +5569,11 @@ unsigned long Gen11::start(void *that,void  *param_1)
 		auto *rid = OSNumber::withNumber(0x1080080ULL, 32);
 		if (rid) { service->setProperty("IOVARendererID", rid); rid->release(); }
 		SYSLOG("ngreen", "XE-GVAID: IOVARendererID = 0x1080080 (ID do AppleIntelTGLGraphicsVADriver)");
+		// xe/gvahevc (21/10): o AppleGVA só oferece HEVC por hardware se o acelerador tiver IOGVAHEVCDecode (o kext ICL
+		// do Tahoe traz "2" no Info.plist; a personality TGL só tem IOGVAHEVCDecodeCapabilities). Sem ela a sessão HEVC
+		// falha com -12906. Com o plugin VA corrigido (macos/vadriver), a decodificação HEVC sai idêntica à de software.
+		service->setProperty("IOGVAHEVCDecode", "2");
+		SYSLOG("ngreen", "XE-GVAHEVC: IOGVAHEVCDecode = \"2\"");
 	}
 	} else {
 		SYSLOG("ngreen", "V52: Real TGL — skipping MultiForceWakeSelect override");
@@ -6742,6 +7007,26 @@ void Gen11::wrapSetGTFrequencyMMIO(void *that, uint32_t val)
 		if (ratio < piso) val = piso << 23;
 	}
 	FunctionCast(wrapSetGTFrequencyMMIO, callback->oSetGTFrequencyMMIO)(that, val);
+}
+
+// 21/10 (XE-IDLEBOUND): desligamentos de 60 a 185 s (e o pânico do watchdog): o WindowServer fica em CGXShutdownDisplays ->
+// IOFBSetDisplayModeAndDepth -> IntelAccelerator::stopGraphicsEngine -> IGScheduler5::waitForGpuIdle (até 25000 x 100 us),
+// chamado várias vezes, com stamps que nunca retornam. Se uma espera esgota (>= 2 s), as esperas dos próximos 30 s
+// retornam na hora (a marca expira, para não afetar o uso normal). -ngreennoidlebound desliga.
+static volatile uint64_t gXeWedgedUntil = 0; static volatile uint32_t gXeIdleSkips = 0;
+void Gen11::wrapWaitForGpuIdle(void *that)
+{
+	static int off = -1;
+	if (off < 0) off = checkKernelArgument("-ngreennoidlebound") ? 1 : 0;
+	uint64_t now = mach_absolute_time();
+	if (!off && now < gXeWedgedUntil) { gXeIdleSkips++; return; }
+	FunctionCast(wrapWaitForGpuIdle, callback->oWaitForGpuIdle)(that);
+	uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - now, &ns);
+	if (ns >= 2000000000ULL) {
+		uint64_t d = 0; nanoseconds_to_absolutetime(30ULL * 1000000000ULL, &d);
+		gXeWedgedUntil = mach_absolute_time() + d;
+		SYSLOG("ngreen", "XE-IDLEBOUND: waitForGpuIdle levou %llu ms; esperas puladas por 30 s", ns / 1000000ULL);
+	}
 }
 
 // 20/10 (XE-FBDPMS): a tela não acordava do repouso. AppleIntelFramebuffer::setFramebufferPowerState(state) (2=Wake,
@@ -11151,7 +11436,10 @@ uint8_t Gen11::enableController(AppleIntel::AppleIntelFramebuffer *that)
 uint8_t Gen11::setDisplayMode(AppleIntel::AppleIntelFramebuffer *that, int param_1, int param_2)
 {
 	if (getMember<uint32_t>(that, 0x1dc)==0) getMember<uint8_t>(that, 0x1e0)=1;
-	return FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("pre-setDisplayMode");
+	auto r = FunctionCast(setDisplayMode, callback->osetDisplayMode)(that,param_1,param_2 );
+	xeBootDiagDump("post-setDisplayMode");
+	return r;
 
 }
 

@@ -4,7 +4,7 @@ Everything here is built by `macos/build-all.sh` from Apple's 16.0.32 bundles pl
 installed by `macos/install-macos.sh`.
 
 **Version history.** The Metal driver went through builds v1–v12 and MTL13–MTL17 (18–19 Oct); **MTL18** (20 Oct, in
-test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v15 and the LLVM bridge through
+test) is MTL17 with two bytes restored — see the L3 row below. libxedrv went through v7–v16 and the LLVM bridge through
 v1–v2. Every build, with its evidence and result, is in [HISTORY.md](HISTORY.md) and [CATALOG.md](CATALOG.md) §4;
 abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
@@ -13,6 +13,7 @@ abandoned approaches are in [EXPERIMENTS.md](EXPERIMENTS.md).
 /Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle       Metal driver, patched ("MTL17") + libxedrv.dylib
 /Library/GPUBundles/AppleIntelGraphicsShared.bundle             Apple 16.0.32 (profiler and runtime files)
 /System/Library/Caches/xe.bundle                                 shader compiler stack
+/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle        video decode plugin, patched (macos/vadriver/, optional)
 ```
 
 ## 1. Why /Library/GPUBundles and /System/Library/Caches
@@ -65,8 +66,26 @@ An ObjC dylib loaded into every Metal client (WindowServer included) by the driv
    **copies** the pixels. The caller's deallocator still runs when the texture is released.
 5. **Diagnostics**: per-process log in `/tmp/xedrv-<process>.log` with texture formats, pipeline failures and the
    crash handler. Lines are throttled.
+6. **Buffer writes on the 3D blit path (v16, the Chrome fix)**: the driver runs `copyFromBuffer:toBuffer:` and
+   `fillBuffer:` on one of two paths, chosen by `IGBL::shouldUse2DBlit` (driver `+0x8bf48`): the **2D** path (blitter
+   commands in their own segment of the command buffer) for fills and for copies where
+   `(srcOffset - dstOffset) % 64 == 0`, and the **3D** path (shader copy) for the other copies. On this system 3D work
+   in a command buffer does **not** wait for earlier 2D writes in the *same* command buffer: a fill or aligned copy
+   followed by a misaligned copy or a draw that reads the buffer races (fill→misaligned copy 11–17/20 wrong, aligned
+   copy→draw 17/20 wrong; across separate command buffers it is fine). Dawn zero-fills every new buffer with
+   `fillBuffer` and then uploads Graphite's static vertex/index data with mostly misaligned copies in the same blit
+   encoder, so the zero fill often landed last: the static **index buffer stayed all zero** and every rounded rect,
+   path and stroke drew nothing (missing toolbar icons, `border-radius` ignored, the Google logo as a bar). It was a
+   per-launch race; with a populated cache Chrome starts faster and lost it almost every time, which is why it looked
+   cache-related. v16 never writes buffers on the 2D path: `fillBuffer:range:value:` (and `pattern4:`) becomes a copy
+   from a shared pattern buffer with a relative offset of 4, and an aligned buffer→buffer copy becomes two misaligned
+   copies through a pooled temporary buffer (`src → tmp[(so+4)%64] → dst`). Everything then runs on the 3D path, which
+   is ordered. Tests: `~/xe/build/chromecache/tests` (`fillcopy`, `paths`, `fcoff`, `blitrender`, `bigcopy`).
+   The underlying 2D↔3D segment fence is a kernel-side gap (BCS/RCS sync) and still applies to 2D texture blits,
+   which have not been seen to fail.
 
-Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4.
+Environment switches: `XE_COMPRESSAO=1` keeps compression, `XE_NOCOPY_ZERO=1` disables fix 4, `XE_FILL_NATIVO=1`
+disables fix 6, `XE_COPIA_NATIVA=1` keeps aligned buffer copies on the 2D path (fills stay fixed).
 
 ## 4. Shader compiler (xe.bundle)
 
@@ -83,10 +102,34 @@ links LLVM 3902.
 
 `build-shader-compiler.sh` regenerates the libLLVM stub from the running system (`dyld_info -exports`).
 
-## 5. Known gaps in this layer
+## 5. Video decode plugin (macos/vadriver/)
 
-- `BGR10_XR` / `w30r` (extended-range 10-bit) isn't supported by the 16.0.32 driver.
-- Hardware video decode/encode is off (see XE-NOGVA). Decoding with an explicit output pixel format fails in
-  VideoToolbox (`-6680`), which is why Safari can't play YouTube. Chrome with `--disable-gpu
-  --disable-gpu-compositing` plays it with software decode.
+`macos/vadriver/build-vadriver.sh <stock VADriver bundle or sle/>` copies Apple's 16.0.32
+`AppleIntelTGLGraphicsVADriver.bundle`, applies the patch scripts in order (each one checks the original bytes first)
+and ad-hoc signs the result. AppleGVA only loads it from `/Library/GPUBundles`, and only when the accelerator keeps the
+`IOGVA*` keys (`-ngreengva`). Code caves sit in the zero padding after the load commands (r-x `__TEXT`, 0xb00–0x1100).
+
+| Step | Script | Problem on Tahoe / RPL | Fix |
+|---|---|---|---|
+| 1 | `patch-vadriver.py` | device-id whitelist, accelerator lookup, Tahoe no longer fills the bitstream request (`bwar`), unknown driver parameters, the plugin dlopens the *ICL* VAME | 9A49 accepted, lookup by name, checks skipped, unknown parameters skipped, VAME name ICL→TGL |
+| 2 | `patch_nodes.py` | AppleGVA walks capability nodes with the next link at +0x430 (plugin: +0x428) | nodes 0x438 bytes, link at both offsets |
+| 3 | `patch_nodelayout.py` | Tahoe nodes have a new u64 at +0x20, so every list moved by 8 → H.264 node had no input format (`-12913`); Tahoe asks driver parameter 14 (capability list), the plugin knows 2–12 | AppleGVA gets a converted deep copy of the list (at accelerator create and for parameter 14); the plugin keeps its own layout |
+| 4 | `patch_payloadhdr.py` | CodecHAL sideband payload header never committed for decode (`je` at 0x64a15) → the kernel reads relocation 0 as an indirect-batch handle, the lookup fails and IOAcceleratorFamily2 drops every decode batch ("commands on floor") → empty frames | always commit it |
+| 5 | `patch_pitchdelta.py` | SURFACE_STATE pitch relocation delta already holds pitch-1 = -1 → pitch one too small | clear the field before the kernel adds pitch-1 |
+| 6 | `patch_spsshift.py` | Tahoe's H.264 SPS structure has 8 extra bytes before `level_idc` → MFX_AVC_IMG_STATE with chroma 4:4:4, MBAFF, wrong frame_num/POC widths → garbage and a VCS0 hang | the three SPS readers use SPS+8 |
+| 7 | `patch_hcpsurface.py` | HEVC: the HCP surface-state builder fills the command but never adds it to the batch; its relocations land on HCP_PIPE_BUF_ADDR_STATE | emit it (5 dwords) |
+| 8 | `patch_hevclastslice.py` | HEVC: Tahoe AppleGVA never sets LastSliceOfPic in the slice parameters | set it on the last slice, clear it elsewhere |
+
+`--trace` adds an `LC_LOAD_DYLIB` for `tools/diagnostics/xe-vatrace.c` (logs every IOAccelerator/IOKit call of the
+plugin, subsystem `xe.vatrace`); off by default. With all steps, H.264 and HEVC (8-bit 4:2:0) decode bit-exact against
+the software decoder in tests. HEVC sessions also need the accelerator property `IOGVAHEVCDecode` = "2" (the ICL kext
+has it, the TGL one doesn't; without it HEVC fails with `-12906`). Safari can't use the plugin: the
+`com.apple.WebKit.GPU` sandbox denies `file-map-executable` for `/Library/GPUBundles`, so Safari decodes on the CPU.
+
+## 6. Known gaps in this layer
+
+- `BGR10_XR` / `w30r` (extended-range 10-bit) is not available on any Intel/AMD Mac: Metal's format validation requires the Apple1 GPU family, CoreAnimation only maps `w30r`/`w40a` for Apple2+ devices, and the 16.0.32 driver/Gen12 hardware have no XR surface format. Forcing CoreAnimation's Apple2 bit makes 10-bit 4:2:2/4:2:0 video use Apple-only multi-plane formats (crash), so it stays unsupported.
+- Hardware video decode needs `-ngreengva` and the plugin above (section 5); Safari still decodes on the CPU, and
+  hardware encode is untested. Without `-ngreengva` (XE-NOGVA) VideoToolbox decodes and converts in software.
 - Chrome's own GPU path (ANGLE/Metal) draws blank windows.
+- Chrome (Graphite/Dawn) rendering with a populated GPU cache: fixed in libxedrv v16 (item 6 above).
