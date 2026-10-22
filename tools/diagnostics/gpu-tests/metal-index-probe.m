@@ -29,9 +29,32 @@ int main(void) { @autoreleasepool {
         "M4 as M1 plus a buffer memory barrier before the draw", "M5 as M1 but the draw reads a DIFFERENT index buffer each row (no reuse)",
         "M6 as M3 (compute copy) plus a buffer barrier in the render encoder before the draw", "M7 as M3 but the compute copy is its own command buffer, no waits",
         "M8 as M3 plus a buffer barrier inside the compute encoder after the dispatch", "M9 as M3 but the copy is followed by a tiny blit fill (a blitter operation in between)",
-        "M10 compute copy into a DIFFERENT index buffer for every row (no reuse), no waits", "M11 compute copy into the same buffer, wait for the GPU after every row" };
+        "M10 compute copy into a DIFFERENT index buffer for every row (no reuse), no waits", "M11 compute copy into the same buffer, wait for the GPU after every row",
+        "M13 as M3 plus an MTLFence from the compute encoder to the render encoder", "M14 as M3 plus useResource:(index buffer) usage:Read in the render encoder before the draw",
+        "M15 as M3 but the render encoder also binds the index buffer as a vertex buffer (read)" };
     id<MTLBuffer> ibs[N]; for (int i = 0; i < N; i++) ibs[i] = [dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
-    for (int mode = 0; mode < 12; mode++) {
+    // M12: does the compute write reach memory? copy with the compute kernel, wait, read the destination on the CPU.
+    {
+        int cpu_bad = 0, draw_bad = 0;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor]; rp.colorAttachments[0].texture = tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        { id<MTLCommandBuffer> c = [q commandBuffer]; id<MTLRenderCommandEncoder> e = [c renderCommandEncoderWithDescriptor:rp]; [e endEncoding]; [c commit]; [c waitUntilCompleted]; }
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        memset(ib.contents, 0xee, 64);
+        for (int i = 0; i < N; i++) {
+            int k = i % 3; uint32_t idx[3] = { k*3, k*3+1, k*3+2 }; memcpy((char *)stage.contents + i * 16, idx, 12);
+            id<MTLCommandBuffer> c = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [c computeCommandEncoder]; [ce setComputePipelineState:cps]; [ce setBuffer:stage offset:i*16 atIndex:0]; [ce setBuffer:ib offset:0 atIndex:1];
+            [ce dispatchThreads:MTLSizeMake(3,1,1) threadsPerThreadgroup:MTLSizeMake(3,1,1)]; [ce endEncoding]; [c commit]; [c waitUntilCompleted];
+            uint32_t *got = (uint32_t *)ib.contents; if (got[0] != idx[0] || got[1] != idx[1] || got[2] != idx[2]) cpu_bad++;
+            c = [q commandBuffer]; id<MTLRenderCommandEncoder> e = [c renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:rps]; [e setVertexBuffer:vp offset:0 atIndex:0]; [e setVertexBuffer:vc offset:0 atIndex:1]; [e setScissorRect:(MTLScissorRect){ 0, (NSUInteger)i, 8, 1 }];
+            [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:MTLIndexTypeUInt32 indexBuffer:ib indexBufferOffset:0]; [e endEncoding]; [c commit]; [c waitUntilCompleted];
+        }
+        static uint8_t px[8 * N * 4]; [tex getBytes:px bytesPerRow:8 * 4 fromRegion:MTLRegionMake2D(0, 0, 8, N) mipmapLevel:0];
+        for (int i = 0; i < N; i++) { uint8_t *c = &px[(i * 8 + 3) * 4]; int k = i % 3; if (c[0] != (k == 0) * 255 || c[1] != (k == 1) * 255 || c[2] != (k == 2) * 255) draw_bad++; }
+        printf("M12 compute copy, GPU waited each time: CPU reads the destination wrong %d of %d times; the draw is wrong %d of %d times\n", cpu_bad, N, draw_bad, N);
+    }
+    for (int mode = 0; mode < 15; mode++) {
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor]; rp.colorAttachments[0].texture = tex;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
         { id<MTLCommandBuffer> c = [q commandBuffer]; id<MTLRenderCommandEncoder> e = [c renderCommandEncoderWithDescriptor:rp]; [e endEncoding]; [c commit]; [c waitUntilCompleted]; }
@@ -45,13 +68,19 @@ int main(void) { @autoreleasepool {
             id<MTLCommandBuffer> c = [q commandBuffer];
             if (mode == 1 || mode == 4 || mode == 5) { id<MTLBlitCommandEncoder> b = [c blitCommandEncoder]; [b copyFromBuffer:stage sourceOffset:i*16 toBuffer:dst destinationOffset:0 size:12]; [b endEncoding]; }
             if (mode == 2) { id<MTLBlitCommandEncoder> b = [c blitCommandEncoder]; [b copyFromBuffer:stage sourceOffset:i*16 toBuffer:dst destinationOffset:0 size:12]; [b endEncoding]; [c commit]; c = [q commandBuffer]; }
-            if (mode == 3 || mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11) { id<MTLComputeCommandEncoder> ce = [c computeCommandEncoder]; [ce setComputePipelineState:cps]; [ce setBuffer:stage offset:i*16 atIndex:0]; [ce setBuffer:dst offset:0 atIndex:1]; [ce dispatchThreads:MTLSizeMake(3,1,1) threadsPerThreadgroup:MTLSizeMake(3,1,1)];
+            id<MTLFence> fence = nil;
+            if (mode == 13) fence = [dev newFence];
+            if (mode == 3 || mode == 6 || mode == 7 || mode == 8 || mode == 9 || mode == 10 || mode == 11 || mode == 13 || mode == 14 || mode == 15) { id<MTLComputeCommandEncoder> ce = [c computeCommandEncoder]; [ce setComputePipelineState:cps]; [ce setBuffer:stage offset:i*16 atIndex:0]; [ce setBuffer:dst offset:0 atIndex:1]; [ce dispatchThreads:MTLSizeMake(3,1,1) threadsPerThreadgroup:MTLSizeMake(3,1,1)];
                 if (mode == 8) [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                if (mode == 13) [ce updateFence:fence];
                 [ce endEncoding];
                 if (mode == 9) { id<MTLBlitCommandEncoder> b = [c blitCommandEncoder]; [b fillBuffer:stage range:NSMakeRange(N * 16 - 4, 4) value:0]; [b endEncoding]; }
                 if (mode == 7) { [c commit]; c = [q commandBuffer]; } }
             id<MTLRenderCommandEncoder> e = [c renderCommandEncoderWithDescriptor:rp];
             [e setRenderPipelineState:rps]; [e setVertexBuffer:vp offset:0 atIndex:0]; [e setVertexBuffer:vc offset:0 atIndex:1];
+            if (mode == 13) [e waitForFence:fence beforeStages:MTLRenderStageVertex];
+            if (mode == 14) [e useResource:dst usage:MTLResourceUsageRead stages:MTLRenderStageVertex];
+            if (mode == 15) [e setVertexBuffer:dst offset:0 atIndex:2];
             if (mode == 4 || mode == 6) [e memoryBarrierWithScope:MTLBarrierScopeBuffers afterStages:MTLRenderStageVertex beforeStages:MTLRenderStageVertex];
             [e setScissorRect:(MTLScissorRect){ 0, (NSUInteger)i, 8, 1 }];
             [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:3 indexType:MTLIndexTypeUInt32 indexBuffer:dst indexBufferOffset:0];

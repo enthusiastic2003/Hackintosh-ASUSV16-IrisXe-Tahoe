@@ -177,3 +177,15 @@ invalidate it (CPU writes and blits do; a new address misses the cache). `MTLBar
 by libxedrv v15/v16/v17. Candidate fixes (none tried): emit a PIPE_CONTROL with VF cache invalidate when the same index buffer
 is drawn again (patch the Metal driver, as `macos/patch-mtl17.py` does for other things), or make whatever the GL layer uses
 for `glBufferSubData` a blit instead of a shader copy.
+
+
+### Correction and further results (same day): it is a compute -> draw ordering bug inside one command buffer
+
+The "stale index cache" reading above was incomplete. Later runs of `metal-index-probe.m`:
+
+- compute copy, **GPU waited on, then the draw in a separate command buffer** (M12): CPU readback and the draw are both correct (0 of 256 wrong). The compute write does reach memory and is not stale.
+- compute copy and the draw in the **same command buffer** (M3, M11): 40-140 of 256 wrong, even when the GPU is waited on after each command buffer. Timing dependent (the count changes between runs).
+- None of these cures it: `memoryBarrierWithScope:` in the render or compute encoder, an `MTLFence` compute -> render (worse: 170), `useResource:usage:` on the index buffer, binding the index buffer as a vertex buffer, a blit between, a different buffer per row (this one does avoid it: 0), or issuing PIPE_CONTROLs with any FLUSH_TYPE mask (all bits set included) from the render encoder before each indexed draw (`writePipeControl`, global symbol in the driver, C++ object in ivar `_pIGRenderEncoder`; test hook in the session scratchpad, not in the repo).
+- Apple's GL-on-Metal layer does `glBufferSubData` as: blit into a scratch buffer, then a 1x1x1 compute kernel writing the destination, then the draw, all in one command buffer (seen with a spy library hooking `MTLIGAccel*CommandEncoder`).
+
+So within a command buffer the driver does not stall the draw until a preceding compute dispatch has finished (the barrier code only sets dirty bits that no draw turns into a stall). Calling the base-class `IGAccelEncoderBase::writePipeControl` (local symbol, driver +0x98cb8) on the compute encoder from a hook crashed. Not fixed. Untried: a real patch of the driver's compute `endEncoding` (+0x1e4ac `IGAccelComputeCommandEncoder::endEncoding`) to emit a CS-stall PIPE_CONTROL; Minecraft's Vulkan backend (MoltenVK) does not go through the GL layer.
