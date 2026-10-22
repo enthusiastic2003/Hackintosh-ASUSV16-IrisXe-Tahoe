@@ -277,6 +277,55 @@ static bool isV80LEnforcerEnabled() {
 	return checkKernelArgument("-ngreenv80l");
 }
 
+// V130 mode 4 (default): Apple's barrierSubmission, minus the BCS blit-context section that dereferences ctx+0xb8.
+// Same steps and same return contract as Apple's own fallback path (disassembly of barrierSubmission, TGL kext
+// +0x73b7c). IOAccelEventMachineFast2 slots: +0x148 cleanEvent, +0x1c0 copyEventExcluding, +0x1c8 mergeEventExcluding,
+// +0x1f0 writeEventBarrierCommand, +0x188 finishEvent. Build the barrier event in accel+0x11e8 (clean, copy `event`,
+// merge the pending events of every segment resource list queue+0x7b0.. and of the listed stamps and queue+0x668),
+// then write a GPU barrier command for it; if that fails CPU-wait with finishEvent. Returns true once the work this
+// segment depends on is covered.
+static mach_vm_address_t gMergeEventsToBarrier = 0;  // IGAccelSegmentResourceList::mergeEventsToBarrierExcluding
+static uint8_t xeBarrierCpuWait(void *queue, void *accelerator, void *cmdDesc, void *event,
+								uint16_t count, const uint16_t *list) {
+	auto *em = getMember<void *>(accelerator, 0x380);
+	auto **vt = em ? *reinterpret_cast<void ***>(em) : nullptr;
+	if (!vt || !vt[0x148 / 8] || !vt[0x1c0 / 8] || !vt[0x1c8 / 8] || !vt[0x188 / 8] || !gMergeEventsToBarrier) {
+		SYSLOG("ngreen", "V130: xeBarrierCpuWait unavailable em=%p merge=%llx", em, (unsigned long long)gMergeEventsToBarrier);
+		return 1;
+	}
+	void *bev = static_cast<uint8_t *>(accelerator) + 0x11e8;
+	auto *d58 = getMember<void *>(cmdDesc, 0x58);
+	uint32_t ctx = d58 ? getMember<uint32_t>(d58, 0x20) : 0;
+	reinterpret_cast<void (*)(void *, void *)>(vt[0x148 / 8])(em, bev);
+	reinterpret_cast<uint8_t (*)(void *, void *, void *, uint32_t)>(vt[0x1c0 / 8])(em, event, bev, ctx);
+	int n = getMember<int>(queue, 0x830);
+	for (int i = 0; i <= n; i++) {
+		auto *rl = getMember<void *>(queue, 0x7b0 + 8 * i);
+		if (rl)
+			reinterpret_cast<uint8_t (*)(void *, void *, int)>(gMergeEventsToBarrier)(rl, bev, static_cast<int>(ctx));
+	}
+	if (count && list) {
+		auto *em2 = getMember<void *>(getMember<void *>(queue, 0x5c0), 0x380);
+		auto **vt2 = em2 ? *reinterpret_cast<void ***>(em2) : nullptr;
+		auto *tbl = getMember<uint8_t *>(queue, 0x5b8);
+		for (uint16_t j = 0; vt2 && tbl && j < count; j++) {
+			uint32_t id = list[j];
+			if (!id || getMember<uint32_t>(tbl, 0x70) <= id || !getMember<void *>(tbl, 0x68)) continue;
+			auto *stride = getMember<uint8_t *>(tbl, 0x78);
+			uint32_t mul = id * getMember<uint32_t>(stride, 0xcf4);
+			void *stamp = getMember<uint8_t *>(tbl, 0x68) + (static_cast<uint64_t>(mul) << 6);
+			reinterpret_cast<uint8_t (*)(void *, void *, void *, uint32_t)>(vt2[0x1c8 / 8])(em2, stamp, bev, ctx);
+		}
+	}
+	reinterpret_cast<uint8_t (*)(void *, void *, void *, uint32_t)>(vt[0x1c8 / 8])(em, static_cast<uint8_t *>(queue) + 0x668, bev, ctx);
+	// Apple's tail (73ea7..73ef9): IOAccelEventMachineFast2::writeEventBarrierCommand(queue=0, bev, cmdDesc->0x58, ctx)
+	// puts a GPU semaphore wait into the stream; if that is not possible it falls back to finishEvent(bev).
+	if (vt[0x1f0 / 8] &&
+		reinterpret_cast<uint8_t (*)(void *, void *, void *, void *, uint32_t)>(vt[0x1f0 / 8])(em, nullptr, bev, d58, ctx))
+		return 1;
+	return reinterpret_cast<uint8_t (*)(void *, void *)>(vt[0x188 / 8])(em, bev);
+}
+
 static uint32_t getV65Tier1WantBits(bool isRealTGL) {
 	// Real TGL: always use native behavior (RCS + BCS).
 	if (isRealTGL) {
@@ -2010,6 +2059,8 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		SYSLOG("ngreen", "V165: routing %zu HW accelerator symbols", sizeof(requests)/sizeof(requests[0]));
 		PANIC_COND(!RouteRequestPlus::routeAll(patcher, index, requests, address, size), "ngreen","Failed to route symbols");
 		SYSLOG("ngreen", "V165: HW accelerator symbols routed OK");
+		gMergeEventsToBarrier = patcher.solveSymbol(index, "__ZN26IGAccelSegmentResourceList29mergeEventsToBarrierExcludingEP12IOAccelEventi", address, size);
+		SYSLOG("ngreen", "V130: mergeEventsToBarrierExcluding at %llx", (unsigned long long)gMergeEventsToBarrier);
 
 		if (checkKernelArgument("-ngreenxefix")) {  // xe/flipdiag: só contadores, sem mudar comportamento
 			RouteRequestPlus flipDiag[] = {
@@ -8503,10 +8554,11 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 	if (!NGreen::callback->isRealTGL) {
 		// V130: spoof-path guard for deterministic barrierSubmission+0x198 crash.
 		// Boot-arg control (value or flags):
-		//   ngreenV130=0 or -ngreenV130fail -> bypass and return 0 (default)
-		//   ngreenV130=1 or -ngreenV130pass -> bypass and return 1
+		//   ngreenV130=0 or -ngreenV130fail -> bypass and return 0
+		//   ngreenV130=1 or -ngreenV130pass -> bypass and return 1 (old default; drops all ordering)
 		//   ngreenV130=2 or -ngreenV130orig -> call original implementation
 		//   ngreenV130=3 or -ngreenV130hybrid -> bypass during init, original during render
+		//   ngreenV130=4 -> CPU-wait emulation of Apple's fallback path (DEFAULT)
 		// NOTE: on spoofed RPL this is unsafe unless explicitly forced because
 		// the original path submits Blit2D/Blit3D barriers through BCS.
 		// Use -ngreenV130forceorig only when intentionally validating that path.
@@ -8525,9 +8577,9 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			} else if (checkKernelArgument("-ngreenV130fail")) {
 				v130Mode = 0;
 			} else {
-				// Default: bypass+ret1 so GPU scheduler treats barrier as succeeded.
-				// ret0 causes a spin/wait loop in the scheduler → hard freeze.
-				v130Mode = 1;
+				// Default: Apple's barrier semantics without the BCS part. The old default (bypass, ret 1) reported
+				// the dependencies as satisfied without waiting, which lost compute -> draw ordering.
+				v130Mode = 4;
 			}
 
 			if (v130Mode == 2 && !forceOrig) {
@@ -8580,6 +8632,14 @@ uint8_t Gen11::barrierSubmission(void *queue, void *accelerator, void *cmdDesc,
 			if (v130CallCount <= 24 || (v130CallCount > 100 && v130CallCount <= 124)) {
 				SYSLOG("ngreen", "V130[%d]: HYBRID original returned %u", v130CallCount, static_cast<unsigned>(retVal));
 			}
+			return retVal;
+		}
+
+		// Mode 4 (default): CPU-wait emulation of Apple's fallback path (xeBarrierCpuWait), returns its real result.
+		if (v130Mode == 4) {
+			retVal = xeBarrierCpuWait(queue, accelerator, cmdDesc, event, count, list);
+			if (v130CallCount <= 24 || (v130CallCount % 5000) == 0 || retVal == 0)
+				SYSLOG("ngreen", "V130[%d]: CPU-wait barrier returned %u", v130CallCount, static_cast<unsigned>(retVal));
 			return retVal;
 		}
 
