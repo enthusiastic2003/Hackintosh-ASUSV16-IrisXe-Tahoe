@@ -975,7 +975,7 @@
 				Rg==
 				</data>
 				<key>boot-args</key>
-				<string>-v keepsyms=1 IGLogLevel=3 msgbuf=400000 -ngreentglwithgfx -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3 ngreenblmax=48000 alcid=11</string>
+				<string>-v keepsyms=1 debug=0x100 IGLogLevel=3 msgbuf=400000 -ngreentglfb -allow3d -disablegfxfirmware ngreen-dmc=adlp -ngreenv189 -ngreenkeepefi -ngreenxefix -ngreenfixbootmode amfi_get_out_of_my_way=1 ngreenSched=4 ngreenV142=3 ngreenblmax=48000 alcid=11 -ngreentglhw ipc_control_port_options=0</string>
 				<key>csr-active-config</key>
 				<data>
 				EwoAAA==

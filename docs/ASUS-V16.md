@@ -95,3 +95,15 @@ boot; no separate install is needed. Check with `kextstat | grep -i horndis` and
 3. Backlight type (PWM vs AUX) and the external connector table.
 4. Anything in the display path that was only exercised with the reference laptop's 4-lane HBR3 panel (this one is smaller and may be
    2-lane).
+
+## Bring-up notes (A7AB, 22 Oct 2026)
+
+- **L3 banks.** `MIRROR_FUSE3 (0x9118)` reads `0x88` on the A7AB. i915 computes `l3bank_mask = ~fuse3 & 0xF` (two banks per bit), so
+  this part has **6** L3 banks, not 8. `gpuTopology()` defaults to 6 for 0xA7AB (`ngreenl3=N` overrides). With 8 the screen was garbled.
+  `ngreenstatedump=5` logs the fuse registers (`fuses:` lines), including `L3ALLOC` (`0xb134`, reads `0xd0000020` at reset).
+- **Start the accelerator natively** (personality `IOPCIPrimaryMatch 0x9a498086`, as `macos/install-macos.sh` does). Loading it late with a
+  LaunchDaemon leaves `IGAccelDisplayMachine` without display pipes and panics (NULL pointer in
+  `IGAccelDisplayPipe::allocateScanoutMemory`) on the next display-mode set. `tools/xe-native.sh` switches the AuxKC to the native match.
+- **Firefox / multi-process apps.** With `amfi_get_out_of_my_way=1` the kernel kills child processes that send their task port
+  (`EXC_GUARD type=1 flavor=0x20`, `plugin-container`), so Firefox opens a window and never loads a page. Boot-arg
+  `ipc_control_port_options=0` turns the control-port hardening off and fixes it.
