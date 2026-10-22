@@ -107,3 +107,16 @@ boot; no separate install is needed. Check with `kextstat | grep -i horndis` and
 - **Firefox / multi-process apps.** With `amfi_get_out_of_my_way=1` the kernel kills child processes that send their task port
   (`EXC_GUARD type=1 flavor=0x20`, `plugin-container`), so Firefox opens a window and never loads a page. Boot-arg
   `ipc_control_port_options=0` turns the control-port hardening off and fixes it.
+
+## Audio (Realtek ALC256 over HDA)
+
+macOS Tahoe no longer ships AppleHDA, so AppleALC alone has nothing to patch (the SystemKC only has AppleGFXHDA for HDMI). Two things are needed:
+
+1. The PCH audio controller (HDEF, `8086:51ca`, `PciRoot(0x0)/Pci(0x1f,0x3)`) reports PCI class `0x040100` (DSP mode). AppleHDAController only
+   matches `0x0403`, so `EFI/OC/config.plist` sets the device property `class-code = 00 03 04 00`.
+2. A native AppleHDA. [SimpleHDA](https://github.com/laobamac/SimpleHDA) (a Lilu plugin) restores it through OpenCore injection, with AppleALC
+   (`alcid=11`) and `keepsyms=1`. Its kext embeds Apple's AppleHDA binaries, so it is **not committed here**:
+   `zsh tools/install-simplehda.sh /Volumes/BOOT/EFI/OC [config.plist ...]` downloads the pinned release, verifies its SHA-256, copies it to
+   `EFI/OC/Kexts` and adds the `Kernel -> Add` entry after AppleALC. `-shdaoff` disables it.
+
+Result: Built-in Output and Built-in Microphone appear and sound plays. The XPS 13 Plus audio code from upstream (AudShim, SOF/SoundWire) does not apply to this laptop.

@@ -6,3 +6,6 @@ tools/build/
 dist/
 .contentFlavour
 .contentVisibility
+
+# third-party binaries that must not be committed (they embed Apple code)
+EFI/OC/Kexts/SimpleHDA.kext/
