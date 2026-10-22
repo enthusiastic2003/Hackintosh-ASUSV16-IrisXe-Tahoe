@@ -58,6 +58,7 @@ SLE=$NG/sle_Internal/sle; LE=$NG/sle_Internal/le
 
 echo "== 3. build"
 zsh $ROOT/build-nootedgreen.sh | tail -1
+zsh $ROOT/build-hookcase.sh | tail -1
 zsh $ROOT/macos/build-all.sh $SLE | tail -1
 ok "built build/NootedGreen.kext and macos/out/"
 

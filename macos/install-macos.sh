@@ -23,7 +23,9 @@ plutil -replace CFBundleVersion -string 16.0.2 $K
 for b in AppleIntelTGLGraphicsMTLDriver AppleIntelTGLGraphicsGLDriver AppleIntelTGLGraphicsVADriver AppleIntelTGLGraphicsVAME AppleIntelGraphicsShared; do
   put $SLE/$b.bundle /Library/Extensions/$b.bundle
 done
-[[ -d $LE/HookCase.kext ]] && put $LE/HookCase.kext /Library/Extensions/HookCase.kext
+# HookCase (symbol provider the TGL kexts depend on) is not in the NootedGreen le/ folder: build-hookcase.sh builds it
+HC=$LE/HookCase.kext; [[ -d $HC ]] || HC=$HERE/../build/HookCase.kext
+[[ -d $HC ]] && put $HC /Library/Extensions/HookCase.kext || echo "warning: HookCase.kext not found (run build-hookcase.sh); the TGL kexts will not load"
 
 echo "== Metal driver (MTL17) and shared bundle in /Library/GPUBundles"
 put $OUT/AppleIntelTGLGraphicsMTLDriver.bundle /Library/GPUBundles/AppleIntelTGLGraphicsMTLDriver.bundle
@@ -33,7 +35,8 @@ echo "== shader compiler in /System/Library/Caches/xe.bundle (writable firmlink 
 put $OUT/xe.bundle /System/Library/Caches/xe.bundle
 
 echo "== registering kexts in the Auxiliary Kernel Collection"
-kexts=(-p /Library/Extensions/AppleIntelTGLGraphics.kext -p /Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext)
+kexts=()
 [[ -d /Library/Extensions/HookCase.kext ]] && kexts+=(-p /Library/Extensions/HookCase.kext)
+kexts+=(-p /Library/Extensions/AppleIntelTGLGraphics.kext -p /Library/Extensions/AppleIntelTGLGraphicsFramebuffer.kext)
 /usr/bin/kmutil load -z --load-style match-only $kexts 2>&1 || true
 echo "done: approve the extension if asked, then reboot"
