@@ -976,7 +976,9 @@ static void xeDiagPattern(const char *name, const uint8_t *find, size_t flen, ma
 // (not the spoofed 9A49); ngreendss / ngreenl3 override. Shared by the HW byte patches and getGPUInfo.
 void Gen11::gpuTopology(uint32_t &dss, uint32_t &l3banks) {
 	dss = (NGreen::callback && NGreen::callback->realDeviceId == 0xA7AB) ? 4 : 6;
-	l3banks = 8;
+	// L3 banks follow MIRROR_FUSE3 (0x9118): i915 uses l3bank_mask = ~fuse3 & 0xF, two banks per bit. A7AB reads 0x88 (low nibble 8
+	// -> mask 0x7 -> 6 banks); the 96-EU A7A0 has 0 (mask 0xF -> 8 banks).
+	l3banks = (NGreen::callback && NGreen::callback->realDeviceId == 0xA7AB) ? 6 : 8;
 	PE_parse_boot_argn("ngreendss", &dss, sizeof(dss));
 	PE_parse_boot_argn("ngreenl3", &l3banks, sizeof(l3banks));
 	if (dss < 1 || dss > 8) dss = 6;
@@ -5139,6 +5141,15 @@ static void xeStateDumpWorker(thread_call_param_t, thread_call_param_t) {
 		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17) | (1u << 1));
 		uint32_t fwAck = 0;
 		for (int i = 0; i < 300; i++) { fwAck = rd(FORCEWAKE_ACK_RENDER_GEN9); if (fwAck & 2) break; IODelay(100); }
+		if (xeDumpCount == 0) {
+			// Hardware fuses as Linux i915 reads them (sseu): which DSS / EUs / L3 banks are really enabled. The topology patches
+			// hardcode only counts; the enabled-unit mask comes from here. Compare with the log line "topology: ...".
+			SYSLOG("ngreen", "fuses: MIRROR_FUSE3(9118)=%08x MIRROR_FUSE1(911c)=%08x FUSE2(9120)=%08x EU_DISABLE(9134)=%08x SLICE_EN(9138)=%08x "
+			       "SS_DISABLE/GEOM_DSS(913c)=%08x VEBOX_VDBOX_DIS(9140)=%08x COMPUTE_DSS(9144)=%08x",
+			       rd(0x9118), rd(0x911c), rd(0x9120), rd(0x9134), rd(0x9138), rd(0x913c), rd(0x9140), rd(0x9144));
+			SYSLOG("ngreen", "fuses: L3 CPUID/misc: GEN7_L3CNTLREG1(b01c)=%08x L3SQCREG1(b010)=%08x SLICE_COMMON_ECO(7304)=%08x MCR_SELECTOR(fdc)=%08x",
+			       rd(0xb01c), rd(0xb010), rd(0x7304), rd(0xfdc));
+		}
 		struct { const char *n; uint32_t b; } eng[] = {{"RCS0", 0x2000}, {"BCS0", 0x22000}};
 		for (auto &e : eng) {
 			SYSLOG("ngreen", "dump#%d %s CTL=%08x HEAD=%08x TAIL=%08x START=%08x MIMODE=%08x MODE=%08x ELS_ST=%08x:%08x ELS_CTL=%08x CSBPTR=%08x IMR=%08x ESR=%08x ACTHD=%08x HWS=%08x",
