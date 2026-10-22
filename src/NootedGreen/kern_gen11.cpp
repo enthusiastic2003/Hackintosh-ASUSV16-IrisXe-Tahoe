@@ -5147,8 +5147,8 @@ static void xeStateDumpWorker(thread_call_param_t, thread_call_param_t) {
 			SYSLOG("ngreen", "fuses: MIRROR_FUSE3(9118)=%08x MIRROR_FUSE1(911c)=%08x FUSE2(9120)=%08x EU_DISABLE(9134)=%08x SLICE_EN(9138)=%08x "
 			       "SS_DISABLE/GEOM_DSS(913c)=%08x VEBOX_VDBOX_DIS(9140)=%08x COMPUTE_DSS(9144)=%08x",
 			       rd(0x9118), rd(0x911c), rd(0x9120), rd(0x9134), rd(0x9138), rd(0x913c), rd(0x9140), rd(0x9144));
-			SYSLOG("ngreen", "fuses: L3 CPUID/misc: GEN7_L3CNTLREG1(b01c)=%08x L3SQCREG1(b010)=%08x SLICE_COMMON_ECO(7304)=%08x MCR_SELECTOR(fdc)=%08x",
-			       rd(0xb01c), rd(0xb010), rd(0x7304), rd(0xfdc));
+			SYSLOG("ngreen", "fuses: L3 CPUID/misc: GEN7_L3CNTLREG1(b01c)=%08x L3SQCREG1(b010)=%08x SLICE_COMMON_ECO(7304)=%08x MCR_SELECTOR(fdc)=%08x L3ALLOC(b134)=%08x L3ALLOC2(b138)=%08x",
+			       rd(0xb01c), rd(0xb010), rd(0x7304), rd(0xfdc), rd(0xb134), rd(0xb138));
 		}
 		struct { const char *n; uint32_t b; } eng[] = {{"RCS0", 0x2000}, {"BCS0", 0x22000}};
 		for (auto &e : eng) {
