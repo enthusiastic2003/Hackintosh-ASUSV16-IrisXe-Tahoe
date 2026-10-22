@@ -11,27 +11,6 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
-
-// Debug slow motion (ngreenslowmo=<ms>): while XeSlowScope is alive on a thread, every SYSLOG on THAT thread is followed by an
-// IOSleep, so an external logger (tools/xe-live-log.py) can copy each milestone to disk before the next, possibly fatal, step.
-// Only the thread that created the scope sleeps; it is used for the accelerator kext-load callback and IntelAccelerator::start.
-static volatile thread_t xeSlowThread = nullptr;
-static uint32_t xeSlowMs = 0;
-static inline void xeSlowPoint() {
-	if (xeSlowThread != nullptr && xeSlowThread == current_thread()) IOSleep(xeSlowMs);
-}
-struct XeSlowScope {
-	bool on {false};
-	XeSlowScope() {
-		uint32_t ms = 0;
-		if (xeSlowThread == nullptr && PE_parse_boot_argn("ngreenslowmo", &ms, sizeof(ms)) && ms > 0 && ms <= 5000) {
-			xeSlowMs = ms; xeSlowThread = current_thread(); on = true;
-		}
-	}
-	~XeSlowScope() { if (on) xeSlowThread = nullptr; }
-};
-#undef SYSLOG
-#define SYSLOG(module, str, ...) do { SYSLOG_COND(true, module, str, ## __VA_ARGS__); xeSlowPoint(); } while (0)
 // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
 extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
 static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
@@ -1818,26 +1797,9 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 	} else if (kextG11HWT.loadIndex == index || kextG11HWTA.loadIndex == index) {
 		this->tglHWLoaded = true;
-		XeSlowScope slowmo;
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
-		// ngreeninjectdelay=<seconds> (debug): inject the accelerator personality from a timer N s after this kext load is
-		// processed, instead of right now. Injecting is what makes IOKit match and start the accelerator, so this separates
-		// "kext loaded + patched" from "accelerator started" without blocking any thread.
-		{
-			uint32_t injDelay = 0;
-			if (PE_parse_boot_argn("ngreeninjectdelay", &injDelay, sizeof(injDelay)) && injDelay > 0 && injDelay <= 600) {
-				static thread_call_t injectTc = nullptr;
-				if (!injectTc) injectTc = thread_call_allocate(injectWorker, nullptr);
-				uint64_t deadline;
-				clock_interval_to_deadline(injDelay, kSecondScale, &deadline);
-				SYSLOG("ngreen", "injectdelay: accelerator personality will be injected in %u s", injDelay);
-				if (injectTc) thread_call_enter_delayed(injectTc, deadline);
-				else injectAcceleratorPersonality(true);
-			} else {
-				injectAcceleratorPersonality(true);
-			}
-		}
+		injectAcceleratorPersonality(true);
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
 
@@ -5198,7 +5160,6 @@ static void xeStateDumpWorker(thread_call_param_t, thread_call_param_t) {
 
 unsigned long Gen11::start(void *that,void  *param_1)
 {
-	XeSlowScope slowmo;
 	{
 		uint32_t di = 0;
 		if (!xeDumpTc && PE_parse_boot_argn("ngreenstatedump", &di, sizeof(di)) && di > 0 && di <= 30) {
@@ -5210,18 +5171,6 @@ unsigned long Gen11::start(void *that,void  *param_1)
 				thread_call_enter_delayed(xeDumpTc, deadline);
 				SYSLOG("ngreen", "statedump: engine registers will be logged every %u s", di);
 			}
-		}
-	}
-	// ngreenstartdelay=<seconds> (debug): wait before the accelerator starts so the boot-watch daemon (up ~14 s after boot) is
-	// already appending the kernel log when the first GPU access happens. Once, before any hardware access.
-	{
-		static bool delayed = false;
-		uint32_t delaySec = 0;
-		if (!delayed && PE_parse_boot_argn("ngreenstartdelay", &delaySec, sizeof(delaySec)) && delaySec > 0 && delaySec <= 120) {
-			delayed = true;
-			SYSLOG("ngreen", "startdelay: sleeping %u s before IntelAccelerator::start", delaySec);
-			IOSleep(delaySec * 1000);
-			SYSLOG("ngreen", "startdelay: done, starting the accelerator");
 		}
 	}
 	// V44: Configurable scheduler type.
@@ -10912,12 +10861,6 @@ bool Gen11::wrapAppleIntelFramebufferStart(void *that, void *provider)
 	bool ret = FunctionCast(wrapAppleIntelFramebufferStart, callback->oAppleIntelFramebufferStart)(that, provider);
 	SYSLOG("ngreen", "V208: AppleIntelFramebuffer::start fb=0 ret=%d", ret);
 	return ret;
-}
-
-void Gen11::injectWorker(thread_call_param_t, thread_call_param_t)
-{
-	SYSLOG("ngreen", "injectdelay: injecting the accelerator personality now");
-	if (callback) callback->injectAcceleratorPersonality(true);
 }
 
 void Gen11::injectAcceleratorPersonality(bool useTglNames)
