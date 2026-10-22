@@ -189,3 +189,14 @@ The "stale index cache" reading above was incomplete. Later runs of `metal-index
 - Apple's GL-on-Metal layer does `glBufferSubData` as: blit into a scratch buffer, then a 1x1x1 compute kernel writing the destination, then the draw, all in one command buffer (seen with a spy library hooking `MTLIGAccel*CommandEncoder`).
 
 So within a command buffer the driver does not stall the draw until a preceding compute dispatch has finished (the barrier code only sets dirty bits that no draw turns into a stall). Calling the base-class `IGAccelEncoderBase::writePipeControl` (local symbol, driver +0x98cb8) on the compute encoder from a hook crashed. Not fixed. Untried: a real patch of the driver's compute `endEncoding` (+0x1e4ac `IGAccelComputeCommandEncoder::endEncoding`) to emit a CS-stall PIPE_CONTROL; Minecraft's Vulkan backend (MoltenVK) does not go through the GL layer.
+
+
+## Minecraft's Vulkan backend (MoltenVK) crashed in the driver's GPU counter code
+
+`hs_err`/library fault log: SIGSEGV in `objc_retain` <- `objc_getProperty` <- `MTLIGCounterSampleBuffer::Init` <-
+`MTLIGCommonCounterManager::CreateCounterSampleBuffer` <- `-[MTLIGAccelDevice newCounterSampleBufferWithDescriptor:error:]`
+<- libMoltenVK (Minecraft enables "Calibrated Timestamps"). The device advertised `counterSets` (timestamp, statistic,
+stageutilization) and `supportsCounterSampling:` for draw, dispatch and blit boundaries, but creating a counter sample buffer
+dereferences a null member. libxedrv v19 turns counter sampling off (`supportsCounterSampling:` NO, empty `counterSets`,
+`newCounterSampleBufferWithDescriptor:error:` returns nil with an error), the same way it already disables binary archives and
+dynamic libraries. Verified with a Metal probe: 3 counter sets before, 0 after.

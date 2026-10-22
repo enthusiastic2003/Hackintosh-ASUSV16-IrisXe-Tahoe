@@ -147,6 +147,15 @@ static id rej_id_arg(id self, SEL c, void* x) { return rej_id(self, c); }
 static void* rej_ptr(id self, SEL c) { rej_id(self, c); return NULL; }
 static void rej_void(id self, SEL c) { LOG("%s não implementado", sel_getName(c)); }
 static void rej_indir(id self, SEL c, id r, uint64_t i) { rej_void(self, c); }
+// v19 (24/10): contadores de GPU. O driver 16.0.32 anuncia counterSets (timestamp/statistic/stageutilization) e supportsCounterSampling, mas
+// newCounterSampleBufferWithDescriptor:error: cai em objc_getProperty/objc_retain com objeto nulo dentro de MTLIGCounterSampleBuffer::Init
+// (o MoltenVK do Minecraft chama isso ao ligar Calibrated Timestamps: SIGSEGV em objc_retain, antes de abrir a janela). Sem amostragem de
+// contadores o MoltenVK segue pelo caminho sem timestamps de GPU.
+static char no_sampling(id self, SEL c, NSUInteger p) { return 0; }
+static id no_counter_sets(id self, SEL c) { return [NSArray array]; }
+static id rej_counter_buf(id self, SEL c, id d, NSError** e) {
+  if (e) *e = [NSError errorWithDomain:@"MTLCounterErrorDomain" code:2 userInfo:@{NSLocalizedDescriptionKey: @"counter sampling is not supported on this device"}];
+  return nil; }
 static BOOL no_cap(id self, SEL c) { return NO; }
 static id rej_archive(id self, SEL c, id d, NSError** e) {
   if (e) *e = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFeatureUnsupportedError userInfo:@{NSLocalizedDescriptionKey: @"Binary archives não suportados no adaptador TGL"}];
@@ -213,6 +222,9 @@ static BOOL install_entries(void) {
   class_replaceMethod(dev, sel_registerName("newBinaryArchiveWithDescriptor:error:"), (IMP)rej_archive, "@32@0:8@16^@24");
   class_replaceMethod(dev, sel_registerName("newDynamicLibrary:error:"), (IMP)rej_dynlib, "@32@0:8@16^@24");
   class_replaceMethod(dev, sel_registerName("newDynamicLibraryWithURL:error:"), (IMP)rej_dynlib, "@32@0:8@16^@24");
+  class_replaceMethod(dev, sel_registerName("supportsCounterSampling:"), (IMP)no_sampling, "c24@0:8Q16");
+  class_replaceMethod(dev, sel_registerName("counterSets"), (IMP)no_counter_sets, "@16@0:8");
+  class_replaceMethod(dev, sel_registerName("newCounterSampleBufferWithDescriptor:error:"), (IMP)rej_counter_buf, "@32@0:8@16^@24");
   g_orig_initport = method_setImplementation(anchor, (IMP)initport_wrapper);
   LOG("%d métodos adicionados, caps/dynlib/archive desligados (índice inválido=%llu, driver base=%p)", added, g_invalid_idx, g_drv_base);
   return YES;
