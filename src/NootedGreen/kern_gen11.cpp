@@ -5575,7 +5575,8 @@ static void xeHangDumpBlock(const char *what, uint64_t gaddr, uint32_t dwords, u
 // context image) and are all conditioned on ADL-P (RPL-P uses adl_p_info) in drivers/gpu/drm/i915/gt/intel_workarounds.c. The GPU hang reports
 // show the render engine stuck on a CS-stall PIPE_CONTROL with PSD/TDL/EUs not done; several of these target exactly that unit.
 // Masked registers take (bit << 16) | bit. MCR registers (0xe4f4, 0xe48c, 0xe18c, 0x9550) are written with the multicast selector as the
-// driver left it (checked, never changed). The worker re-asserts them every second so they survive a GPU restart.
+// driver left it (checked, never changed). Applied once after every Apple startGraphicsEngine (engine init and each restart after a GPU reset, the same
+// points where i915 applies its engine workaround list), never before it (chicken-bit changes before the start leave the ring disabled).
 struct XeWaEntry { uint32_t reg; uint32_t bit; bool masked; bool mcr; const char *name; };
 static const XeWaEntry gXeWa[] = {
 	{0x20ec, 1u << 1,  true,  false, "CS_DEBUG_MODE1.FF_DOP_CLOCK_GATE_DISABLE (Wa_1606700617)"},
@@ -5590,13 +5591,13 @@ static int xeWaOn = -1;
 static bool xeWaLogged = false;
 static uint32_t xeWaReapplied = 0;
 
-// Called from the 1 Hz worker with the render forcewake held. First call logs the values Apple left (before touching anything).
-static void xeI915Wa(NGreen *g) {
+// Called right after Apple's startGraphicsEngine returns (render forcewake is held by the start). The first call logs the values Apple left.
+static void xeI915Wa(NGreen *g, const char *where) {
 	if (xeWaOn < 0) xeWaOn = checkKernelArgument("-ngreeni915wa") ? 1 : 0;
 	bool mcrMulticast = (g->readReg32(0xfdc) & 0x80000000u) != 0;
 	if (!xeWaLogged) {
 		xeWaLogged = true;
-		SYSLOG("ngreen", "i915wa: opt-in %s; MCR_SELECTOR=%08x (multicast=%d). Values left by Apple's driver:", xeWaOn ? "ON" : "off (-ngreeni915wa to enable)",
+		SYSLOG("ngreen", "i915wa[%s]: opt-in %s; MCR_SELECTOR=%08x (multicast=%d). Values left by Apple's driver:", where, xeWaOn ? "ON" : "off (-ngreeni915wa to enable)",
 		       g->readReg32(0xfdc), mcrMulticast);
 		for (auto &e : gXeWa)
 			SYSLOG("ngreen", "i915wa:   %-62s reg %05x = %08x -> bit %s", e.name, e.reg, g->readReg32(e.reg), (g->readReg32(e.reg) & e.bit) ? "already set" : "NOT set");
@@ -5609,8 +5610,8 @@ static void xeI915Wa(NGreen *g) {
 		if (before & e.bit) continue;
 		g->writeReg32(e.reg, e.masked ? ((e.bit << 16) | e.bit) : (before | e.bit));
 		uint32_t after = g->readReg32(e.reg);
-		if (xeWaReapplied++ < 24)
-			SYSLOG("ngreen", "i915wa: applied %s: %08x -> %08x%s", e.name, before, after, (after & e.bit) ? "" : "  (DID NOT STICK)");
+		if (xeWaReapplied++ < 40)
+			SYSLOG("ngreen", "i915wa[%s]: applied %s: %08x -> %08x%s", where, e.name, before, after, (after & e.bit) ? "" : "  (DID NOT STICK)");
 	}
 }
 
@@ -5645,7 +5646,6 @@ static void xeHangWatchWorker(thread_call_param_t, thread_call_param_t) {
 			uint64_t rg = (uint64_t)start + (head >= 128 ? head - 128 : 0);
 			xeHangDumpBlock("RING ", rg, 64, (uint64_t)start + head);
 		}
-		xeI915Wa(g);
 		g->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17));   // drop our reference (clear bit 1 only)
 	}
 	if (xeHwTc) {
@@ -7549,6 +7549,7 @@ unsigned long Gen11::startGraphicsEngine(void *that)
 		SYSLOG("ngreen", "V163: startGraphicsEngine post-clear FF_SLICE_CS_CHICKEN1=0x%08x (ret=%lu)",
 			NGreen::callback->readReg32(GEN7_FF_SLICE_CS_CHICKEN1), ret);
 		xeLrcaRepair("post-start");
+		{ char w[24]; snprintf(w, sizeof(w), "post-start %d", startCount); xeI915Wa(NGreen::callback, w); }
 	}
 
 	return ret;
