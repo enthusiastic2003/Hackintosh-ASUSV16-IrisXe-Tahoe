@@ -154,3 +154,26 @@ handlers with its v9 crash logger and then reset them to `SIG_DFL`. Seen with an
 SIGSEGV/SIGBUS/SIGILL/SIGABRT and forward the fault to it; only log and reset when there was none. The installed library was
 built from v15 (commit 5b16356; v16 and v17 were never installed), so `tools/install-xedrv-fix.sh v15fix` installs v15 + only
 this fix and `v17fix` installs the current source with it. `tools/restore-xedrv.sh` undoes it. New processes pick it up.
+
+
+## Stale index data after a shader write (Minecraft water spikes, Firefox/Chrome upload glitches)
+
+Symptom: Minecraft 26.3 (OpenGL 4.1 over Metal) draws long spikes and flickering in the translucent water layer, text and icons
+partly missing in menus; Firefox's GPU mode smears. Found with the probes in `tools/diagnostics/gpu-tests/`:
+`gl-probe-draw.c` (base vertex, indirect, vertex buffer updates: all pass), `gl-probe-formats.c` (14 vertex formats, culling,
+depth, blending, flat varyings: pass; **index buffer rewritten between draws: FAIL**), `gl-probe-index-update.c`, and
+`metal-index-probe.m` (the same without OpenGL):
+
+| update path before an indexed draw from the same buffer | wrong rows of 256 |
+|---|---|
+| CPU write (waiting) / blit copy / blit in its own command buffer / blit + barrier | 0 |
+| **compute-kernel copy into the index buffer** | **60-80** |
+| compute copy + `memoryBarrierWithScope:` (render or compute encoder), or + a blit in between | 25-63 (no help) |
+| compute copy into a *different* buffer for every row | 0 |
+| compute copy into the same buffer, **GPU waited on after every row** | 80 |
+
+So it is not a race: the index-fetch (VF) cache keeps old data for an address and a *shader* write to that address does not
+invalidate it (CPU writes and blits do; a new address misses the cache). `MTLBarrierScopeBuffers` does nothing visible. Not fixed
+by libxedrv v15/v16/v17. Candidate fixes (none tried): emit a PIPE_CONTROL with VF cache invalidate when the same index buffer
+is drawn again (patch the Metal driver, as `macos/patch-mtl17.py` does for other things), or make whatever the GL layer uses
+for `glBufferSubData` a blit instead of a shader copy.
