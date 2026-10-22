@@ -5519,6 +5519,95 @@ static void xeStateDumpWorker(thread_call_param_t, thread_call_param_t) {
 	}
 }
 
+// ===== GPU hang watchdog (default on, -ngreennohangwatch disables) =====
+// The render engine sometimes ends up stuck inside a batch (EXECLIST busy, RING_HEAD/ACTHD frozen, GPURestart type=2), and Apple's hang
+// report only prints the batch *address*. Once a second this reads RCS0 (HEAD, TAIL, ACTHD); if work is pending and neither HEAD nor
+// ACTHD moved for 3 samples it dumps the engine registers, the batch commands around ACTHD and the ring around HEAD (GGTT addresses are
+// translated through the PTEs and read from physical memory, like V76). At most 6 dumps per boot, one per stuck episode.
+static thread_call_t xeHwTc = nullptr;
+static uint32_t xeHwHead = ~0u, xeHwActhd = ~0u, xeHwStuck = 0, xeHwDumps = 0, xeHwHeld = 0;
+
+static void xeGgttReadDwords(uint64_t gaddr, uint32_t *out, uint32_t dwords) {
+	auto *g = NGreen::callback;
+	uint32_t done = 0;
+	while (done < dwords) {
+		uint64_t a = gaddr + (uint64_t)done * 4;
+		uint32_t page = (uint32_t)(a >> 12), off = (uint32_t)(a & 0xFFF);
+		uint32_t n = (4096 - off) / 4;
+		if (n > dwords - done) n = dwords - done;
+		uint32_t lo = g->readReg32(GGTT_PTE_LO(page)), hi = g->readReg32(GGTT_PTE_HI(page));
+		uint64_t phys = (((uint64_t)hi << 32) | lo) & 0x0000FFFFFFFFF000ULL;
+		bool ok = false;
+		if ((lo & 1) && phys) {
+			auto *desc = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)phys, 4096, kIODirectionIn);
+			if (desc) {
+				auto *map = desc->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache, 0, 4096);
+				if (map) {
+					volatile uint32_t *pg = (volatile uint32_t *)map->getVirtualAddress();
+					for (uint32_t i = 0; i < n; i++) out[done + i] = pg[off / 4 + i];
+					ok = true;
+					map->release();
+				}
+				desc->release();
+			}
+		}
+		if (!ok) for (uint32_t i = 0; i < n; i++) out[done + i] = 0xBAD0BAD0u;   // PTE not present / not mappable
+		done += n;
+	}
+}
+
+static void xeHangDumpBlock(const char *what, uint64_t gaddr, uint32_t dwords, uint32_t mark) {
+	static uint32_t buf[160];
+	if (dwords > 160) dwords = 160;
+	xeGgttReadDwords(gaddr, buf, dwords);
+	for (uint32_t i = 0; i < dwords; i += 8) {
+		uint32_t n = dwords - i < 8 ? dwords - i : 8;
+		uint64_t at = gaddr + (uint64_t)i * 4;
+		SYSLOG("ngreen", "HANGDUMP %s %08llx%s: %08x %08x %08x %08x %08x %08x %08x %08x", what, (unsigned long long)at,
+		       (mark >= at && mark < at + 32) ? " <-- ACTHD/HEAD" : "         ",
+		       buf[i], n > 1 ? buf[i + 1] : 0, n > 2 ? buf[i + 2] : 0, n > 3 ? buf[i + 3] : 0,
+		       n > 4 ? buf[i + 4] : 0, n > 5 ? buf[i + 5] : 0, n > 6 ? buf[i + 6] : 0, n > 7 ? buf[i + 7] : 0);
+	}
+}
+
+static void xeHangWatchWorker(thread_call_param_t, thread_call_param_t) {
+	auto *g = NGreen::callback;
+	if (g && g->isMmioReady()) {
+		auto rd = [g](uint32_t off) -> uint32_t { return g->readReg32(off); };
+		g->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17) | (1u << 1));
+		for (int i = 0; i < 30; i++) { if (rd(FORCEWAKE_ACK_RENDER_GEN9) & 2) break; IODelay(100); }
+		const uint32_t B = 0x2000;
+		uint32_t ctl = rd(B + 0x3c), head = rd(B + 0x34) & 0x001FFFFCu, tail = rd(B + 0x30) & 0x001FFFFCu;
+		uint32_t acthd = rd(B + 0x74), bbaddr = rd(B + 0x140);
+		bool pending = (ctl & 1) && head != tail;
+		if (pending && head == xeHwHead && acthd == xeHwActhd) xeHwStuck++;
+		else { xeHwStuck = 0; xeHwHeld = 0; }
+		xeHwHead = head; xeHwActhd = acthd;
+		if (xeHwStuck >= 3 && !xeHwHeld && xeHwDumps < 6) {
+			xeHwHeld = 1;
+			uint32_t n = ++xeHwDumps;
+			uint32_t start = rd(B + 0x38);
+			SYSLOG("ngreen", "HANGWATCH#%u: RCS0 stuck for %us CTL=%08x HEAD=%08x TAIL=%08x START=%08x ACTHD=%08x BBADDR=%08x BBSTATE=%08x",
+			       n, xeHwStuck, ctl, rd(B + 0x34), rd(B + 0x30), start, acthd, bbaddr, rd(B + 0x110));
+			SYSLOG("ngreen", "HANGWATCH#%u: IPEIR=%08x IPEHR=%08x INSTDONE=%08x EIR=%08x EMR=%08x ESR=%08x ELS_ST=%08x:%08x ELS_CTL=%08x CSBPTR=%08x MI_MODE=%08x MODE=%08x",
+			       n, rd(B + 0x64), rd(B + 0x68), rd(B + 0x6c), rd(B + 0xb0), rd(B + 0xb4), rd(B + 0xb8), rd(B + 0x238), rd(B + 0x234),
+			       rd(B + 0x550), rd(B + 0x3a0), rd(B + 0x9c), rd(B + 0x29c));
+			SYSLOG("ngreen", "HANGWATCH#%u: ERROR_GEN6=%08x GDRST=%08x SC_INSTDONE=%08x SC_INSTDONE_EXTRA=%08x CS_DEBUG_MODE1=%08x CS_CHICKEN1=%08x",
+			       n, rd(0x40a0), rd(0x941c), rd(0x7100), rd(0x7104), rd(B + 0xec), rd(0x2580));
+			uint64_t bb = (uint64_t)(acthd & ~3u);
+			xeHangDumpBlock("BATCH", bb >= 256 ? bb - 256 : 0, 128, bb);                        // 64 dwords before ACTHD, 64 after
+			uint64_t rg = (uint64_t)start + (head >= 128 ? head - 128 : 0);
+			xeHangDumpBlock("RING ", rg, 64, (uint64_t)start + head);
+		}
+		g->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17));   // drop our reference (clear bit 1 only)
+	}
+	if (xeHwTc) {
+		uint64_t deadline;
+		clock_interval_to_deadline(1, kSecondScale, &deadline);
+		thread_call_enter_delayed(xeHwTc, deadline);
+	}
+}
+
 unsigned long Gen11::start(void *that,void  *param_1)
 {
 	{
@@ -5532,6 +5621,15 @@ unsigned long Gen11::start(void *that,void  *param_1)
 				thread_call_enter_delayed(xeDumpTc, deadline);
 				SYSLOG("ngreen", "statedump: engine registers will be logged every %u s", di);
 			}
+		}
+	}
+	if (!xeHwTc && !checkKernelArgument("-ngreennohangwatch")) {
+		xeHwTc = thread_call_allocate(xeHangWatchWorker, nullptr);
+		if (xeHwTc) {
+			uint64_t deadline;
+			clock_interval_to_deadline(10, kSecondScale, &deadline);
+			thread_call_enter_delayed(xeHwTc, deadline);
+			SYSLOG("ngreen", "hangwatch: render-engine hang watchdog armed (1 s samples, dumps the stuck batch)");
 		}
 	}
 	// V44: Configurable scheduler type.
@@ -11722,7 +11820,7 @@ bool Gen11::wrapIGScheduler5IsGpuIdle(const void *that) {
 	if (!idle) {
 		uint32_t instdone = NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE));
 		if ((instdone & ~1U) == 0xfffffffe) {
-			SYSLOG("ngreen", "V212[5]: isGpuIdle override INSTDONE=0x%08x → idle", instdone);
+			{ static uint32_t v212n = 0; if (v212n++ < 16 || (v212n & 0x7ff) == 0) SYSLOG("ngreen", "V212[5]: isGpuIdle override INSTDONE=0x%08x → idle (call %u)", instdone, v212n); }
 			return true;
 		}
 	}
@@ -11734,7 +11832,7 @@ bool Gen11::wrapIGScheduler4IsGpuIdle(const void *that) {
 	if (!idle) {
 		uint32_t instdone = NGreen::callback->readReg32(RING_INSTDONE(RENDER_RING_BASE));
 		if ((instdone & ~1U) == 0xfffffffe) {
-			SYSLOG("ngreen", "V212[4]: isGpuIdle override INSTDONE=0x%08x → idle", instdone);
+			{ static uint32_t v212n = 0; if (v212n++ < 16 || (v212n & 0x7ff) == 0) SYSLOG("ngreen", "V212[4]: isGpuIdle override INSTDONE=0x%08x → idle (call %u)", instdone, v212n); }
 			return true;
 		}
 	}
