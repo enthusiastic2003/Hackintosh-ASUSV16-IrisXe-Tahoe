@@ -11,6 +11,27 @@ static bool xeFixEnabled();  // xe/xefix, definido junto do FastWriteRegister32
 #include <IOKit/IOCatalogue.h>
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+
+// Debug slow motion (ngreenslowmo=<ms>): while XeSlowScope is alive on a thread, every SYSLOG on THAT thread is followed by an
+// IOSleep, so an external logger (tools/xe-live-log.py) can copy each milestone to disk before the next, possibly fatal, step.
+// Only the thread that created the scope sleeps; it is used for the accelerator kext-load callback and IntelAccelerator::start.
+static volatile thread_t xeSlowThread = nullptr;
+static uint32_t xeSlowMs = 0;
+static inline void xeSlowPoint() {
+	if (xeSlowThread != nullptr && xeSlowThread == current_thread()) IOSleep(xeSlowMs);
+}
+struct XeSlowScope {
+	bool on {false};
+	XeSlowScope() {
+		uint32_t ms = 0;
+		if (xeSlowThread == nullptr && PE_parse_boot_argn("ngreenslowmo", &ms, sizeof(ms)) && ms > 0 && ms <= 5000) {
+			xeSlowMs = ms; xeSlowThread = current_thread(); on = true;
+		}
+	}
+	~XeSlowScope() { if (on) xeSlowThread = nullptr; }
+};
+#undef SYSLOG
+#define SYSLOG(module, str, ...) do { SYSLOG_COND(true, module, str, ## __VA_ARGS__); xeSlowPoint(); } while (0)
 // xe/blitscratch2: definidos em kern_green.cpp (wrapLockCpu)
 extern void *volatile gXeBlitMem, *volatile gXeBlitCpu;
 static volatile uint32_t gXeGtFreqApple = 0, gXeGtFreqN = 0;  // XE-GTFREQ: último pedido da Apple, nº de pedidos
@@ -62,6 +83,14 @@ static KernelPatcher::KextInfo kextG11HWTA {"com.apple.driver.AppleIntelTGLGraph
 	{false, false, false, true}, {},
 	KernelPatcher::KextInfo::Unloaded};
 
+// HookCase — symbol provider the TGL kexts link against (AppleIntelPortHAL::probePortMode, register accessors).
+static const char *pathsHookCase[] = {
+    "/Library/Extensions/HookCase.kext/Contents/MacOS/HookCase",
+};
+static KernelPatcher::KextInfo kextHookCase {"org.smichaud.HookCase", pathsHookCase, 1,
+    {false, false, false, true}, {},
+    KernelPatcher::KextInfo::Unloaded};
+
 // IOAcceleratorFamily2 symbols are resolved inside NGreen::processKext via
 // kextIOAcceleratorFamily2 (kern_green.cpp) which already has the valid path.
 // No separate kextIOAF2 registration needed here.
@@ -82,7 +111,10 @@ void Gen11::init() {
 		SYSLOG("ngreen", "Gen11::init: FB tier → TGL (ICL FB skipped)");
 		lilu.onKextLoadForce(&kextG11FBT);
 		lilu.onKextLoadForce(&kextG11FBTA);
-		if (checkKernelArgument("-ngreentglwithgfx")) {
+		lilu.onKextLoadForce(&kextHookCase);
+		// -ngreentglwithgfx = TGL HW tier PLUS the reference panel's TCON patches (Path E) and cameliav=2.
+		// -ngreentglhw (debug) = the TGL HW tier only, with the FB tier left exactly as in the framebuffer-only boot.
+		if (checkKernelArgument("-ngreentglwithgfx") || checkKernelArgument("-ngreentglhw")) {
 			SYSLOG("ngreen", "Gen11::init: HW tier → TGL (ICL HW skipped)");
 			lilu.onKextLoadForce(&kextG11HWT);
 			lilu.onKextLoadForce(&kextG11HWTA);
@@ -937,7 +969,84 @@ static void fbTimingsWorker(thread_call_param_t, thread_call_param_t) {
 	}
 }
 
+// Debug (accelerator patch sites): report what the loaded image really contains at a patch site, and whether a plain scan of the
+// window finds the pattern. Used to explain "patch NOT FOUND" for patterns that exist in the kext file.
+static void xeDiagPattern(const char *name, const uint8_t *find, size_t flen, mach_vm_address_t address, size_t size, uint32_t expOff) {
+	SYSLOG("ngreen", "diag %s: image=0x%llx size=0x%zx expected at +0x%x", name, (unsigned long long)address, size, expOff);
+	if (!find || !flen || !address || size < flen) return;
+	if (static_cast<size_t>(expOff) + flen <= size) {
+		const uint8_t *mem = reinterpret_cast<const uint8_t *>(address) + expOff;
+		int mism = -1;
+		for (size_t i = 0; i < flen; i++) if (mem[i] != find[i]) { mism = static_cast<int>(i); break; }
+		SYSLOG("ngreen", "diag %s: at expected site %s (first mismatch byte %d: mem=%02x want=%02x)", name,
+			   mism < 0 ? "MATCHES" : "DIFFERS", mism, mism < 0 ? 0 : mem[mism], mism < 0 ? 0 : find[mism]);
+		SYSLOG("ngreen", "diag %s: mem[0..15]=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", name,
+			   mem[0], mem[1], mem[2], mem[3], mem[4], mem[5], mem[6], mem[7], mem[8], mem[9], mem[10], mem[11], mem[12], mem[13], mem[14], mem[15]);
+	} else {
+		SYSLOG("ngreen", "diag %s: expected offset is beyond the window", name);
+	}
+	size_t hits = 0, first = 0;
+	const uint8_t *base = reinterpret_cast<const uint8_t *>(address);
+	for (size_t off = 0; off + flen <= size; off++) {
+		if (base[off] == find[0] && !memcmp(base + off, find, flen)) { if (!hits) first = off; hits++; }
+	}
+	SYSLOG("ngreen", "diag %s: window scan found %zu hit(s), first at +0x%zx", name, hits, first);
+}
+
+// Per-SKU GPU topology: A7A0 is 96 EU (6 DSS), A7AB (Core 7 240H) is 64 EU (4 DSS). The real PCI device-id is used
+// (not the spoofed 9A49); ngreendss / ngreenl3 override. Shared by the HW byte patches and getGPUInfo.
+void Gen11::gpuTopology(uint32_t &dss, uint32_t &l3banks) {
+	dss = (NGreen::callback && NGreen::callback->realDeviceId == 0xA7AB) ? 4 : 6;
+	l3banks = 8;
+	PE_parse_boot_argn("ngreendss", &dss, sizeof(dss));
+	PE_parse_boot_argn("ngreenl3", &l3banks, sizeof(l3banks));
+	if (dss < 1 || dss > 8) dss = 6;
+	if (l3banks < 1 || l3banks > 16) l3banks = 8;
+}
+
+// Replacement for HookCase's AppleIntelPortHAL::probePortMode (the Tiger Lake framebuffer links against it). HookCase's own
+// copy reads SHOTPLUG_CTL through a global `callback` pointer that is never assigned, which is a kernel NULL dereference.
+// Same decision logic, but the register is read through the framebuffer controller's own MMIO mapping
+// (controller at this+0x6a8, mapping base at +0x9B0, length at +0xC78, as in HookCase's ReadRegister32).
+uint32_t Gen11::hcProbePortMode(void *that) {
+	enum { kInvalid = 0, kType1 = 1, kType2 = 2, kType3 = 3 };
+	if (!that) return kInvalid;
+	uint32_t registerValue = 0xffffffffu;
+	if (auto *bc = getMember<void *>(that, 0x6a8)) {
+		const uint32_t len = getMember<uint32_t>(bc, 0xC78);
+		const uint64_t base = getMember<uint64_t>(bc, 0x9B0);
+		if (base && len > 0x1638a0 + 4) registerValue = *reinterpret_cast<volatile uint32_t *>(base + 0x1638a0); // ADL-P/RPL-P SHOTPLUG_CTL
+	}
+	auto *portTypePtr = getMember<uint32_t *>(that, 0x548);
+	if (!portTypePtr) return kInvalid;
+	const uint32_t portType = *portTypePtr;
+	auto pick = [registerValue](uint32_t type2Bit, uint32_t type3Bit) -> uint32_t {
+		if (registerValue == 0xffffffffu) return kInvalid;
+		if (registerValue & type2Bit) return kType2;
+		if (registerValue & type3Bit) return kType3;
+		return kInvalid;
+	};
+	switch (portType) {
+		case 0:
+		case 1: return kType1;
+		case 2: return pick(0x40, 0x20);
+		case 3: return pick(1u << 14, 1u << 13);
+		case 4: return pick(1u << 22, 1u << 21);
+		case 5: return pick(1u << 30, 1u << 29);
+		default: return kInvalid;
+	}
+}
+
 bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
+	if (kextHookCase.loadIndex == index) {
+		RouteRequestPlus hcRequests[] = {
+			{"__ZN17AppleIntelPortHAL13probePortModeEv", hcProbePortMode},
+			{"__ZN17AppleInteePortHAL13probePortModeEv", hcProbePortMode},
+		};
+		const bool ok = RouteRequestPlus::routeAll(patcher, index, hcRequests, address, size);
+		SYSLOG("ngreen", "HookCase loaded: probePortMode %s", ok ? "rerouted (NULL-callback fix)" : "NOT rerouted");
+		return true;
+	}
 	if (kextG11FB.loadIndex == index) {
 		gIcLFbBlockRuns++;
 		if (this->tglFBLoaded) {
@@ -1709,9 +1818,26 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 
 	} else if (kextG11HWT.loadIndex == index || kextG11HWTA.loadIndex == index) {
 		this->tglHWLoaded = true;
+		XeSlowScope slowmo;
 		auto *activeKext = (kextG11HWTA.loadIndex == index) ? &kextG11HWTA : &kextG11HWT;
 		SYSLOG("ngreen", "init AppleIntelTGLGraphics (HW accelerator)");
-		injectAcceleratorPersonality(true);
+		// ngreeninjectdelay=<seconds> (debug): inject the accelerator personality from a timer N s after this kext load is
+		// processed, instead of right now. Injecting is what makes IOKit match and start the accelerator, so this separates
+		// "kext loaded + patched" from "accelerator started" without blocking any thread.
+		{
+			uint32_t injDelay = 0;
+			if (PE_parse_boot_argn("ngreeninjectdelay", &injDelay, sizeof(injDelay)) && injDelay > 0 && injDelay <= 600) {
+				static thread_call_t injectTc = nullptr;
+				if (!injectTc) injectTc = thread_call_allocate(injectWorker, nullptr);
+				uint64_t deadline;
+				clock_interval_to_deadline(injDelay, kSecondScale, &deadline);
+				SYSLOG("ngreen", "injectdelay: accelerator personality will be injected in %u s", injDelay);
+				if (injectTc) thread_call_enter_delayed(injectTc, deadline);
+				else injectAcceleratorPersonality(true);
+			} else {
+				injectAcceleratorPersonality(true);
+			}
+		}
 		NGreen::callback->setRMMIOIfNecessary();
 		SYSLOG("ngreen", "V165: setRMMIO done, starting symbol resolve");
 
@@ -1727,6 +1853,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			            "V144: Failed to resolve Blit3DExtendedCtxParams");
 		}
 
+		SYSLOG("ngreen", "step: Blit3D symbol solve done");
 		const bool wegCoexist = isWEGCoexistMode();
 		const bool forceFullMTL = shouldForceFullMetalPath();
 
@@ -1889,6 +2016,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			if (!gKernelPmap) patcher.clearError();
 			IOLog("XeNG PAGEONGUARD: pmap_find_phys=%s kernel_pmap=%s\n", gPmapFindPhys ? "ok" : "NAO", gKernelPmap ? "ok" : "NAO");
 			if (!SolveRequestPlus::solveAll(patcher, index, poshSolve, address, size)) { patcher.clearError(); IOLog("XeNG POSH: getVirtualAddress nao resolvido\n"); }
+			SYSLOG("ngreen", "step: routing ring/flip diag hooks");
 			bool okr = RouteRequestPlus::routeAll(patcher, index, ringDiag, address, size);
 			if (!okr) patcher.clearError();
 			IOLog("XeNG RING diag hooks: %s\n", okr ? "OK" : "FALHOU");
@@ -1898,6 +2026,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 
 		{
+			SYSLOG("ngreen", "step: routing IntelAccelerator::start");
 			RouteRequestPlus startRoute[] = {
 				{"__ZN16IntelAccelerator5startEP9IOService", start, this->ostart},
 			};
@@ -1911,6 +2040,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		{
 			// loadGuCBinary: always route — WEG's firmware path is Mojave-gated and dead on Sonoma.
 			// Without this hook, no GuC binary loads at all in coexist mode → ring dead.
+			SYSLOG("ngreen", "step: routing loadGuCBinary");
 			RouteRequestPlus firmwareRoute[] = {
 				{"__ZN13IGHardwareGuC13loadGuCBinaryEv", loadGuCBinary, this->oloadGuCBinary},
 			};
@@ -1922,6 +2052,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// Binary pattern (f_devstart) may not match every Sonoma build variant.
 			// This symbol-based hook guarantees deviceStart returns true regardless of
 			// BCS ring state, so the accelerator device is always registered with IOKit.
+			SYSLOG("ngreen", "step: routing IGAccelDevice::deviceStart");
 			RouteRequestPlus devStartRoute[] = {
 				{"__ZN13IGAccelDevice11deviceStartEv", deviceStart, this->odeviceStart},
 			};
@@ -1933,6 +2064,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 
 		if (!wegCoexist || forceFullMTL) {
+			SYSLOG("ngreen", "step: routing coexist-off symbols");
 			RouteRequestPlus coexistOffRoutes[] = {
 				// ForceWake: replace Apple's SafeForceWakeMultithreaded with i915-ported version.
 				// Apple's code uses 90ms timeouts and no fallback; ours uses 50ms + reserve-bit fallback.
@@ -1946,6 +2078,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		}
 
 		if (!wegCoexist) {
+			SYSLOG("ngreen", "step: routing getGPUInfo");
 			RouteRequestPlus gpuInfoRoute[] = {
 				{"__ZN16IntelAccelerator10getGPUInfoEv", getGPUInfo, this->ogetGPUInfo},
 			};
@@ -2008,16 +2141,12 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 		// (4 DSS -> 8 SS). Defaults follow the real PCI device-id (read before the config-read spoof is routed);
 		// ngreendss=<DSS count> and ngreenl3=<L3 banks> override. MaxEU/SS stays 8 (two 8-EU subslices per DSS).
 		{
-			uint32_t dss = (NGreen::callback && NGreen::callback->deviceId == 0xA7AB) ? 4 : 6;
-			uint32_t l3banks = 8;
-			PE_parse_boot_argn("ngreendss", &dss, sizeof(dss));
-			PE_parse_boot_argn("ngreenl3", &l3banks, sizeof(l3banks));
-			if (dss < 1 || dss > 8) dss = 6;
-			if (l3banks < 1 || l3banks > 16) l3banks = 8;
+			uint32_t dss, l3banks;
+			gpuTopology(dss, l3banks);
 			r3bbb[4] = static_cast<uint8_t>(dss * 2);
 			r3b[28] = static_cast<uint8_t>(l3banks);
-			SYSLOG("ngreen", "topology: deviceId=0x%x DSS=%u (SS=%u, EU=%u) L3 banks=%u",
-				   NGreen::callback ? NGreen::callback->deviceId : 0, dss, dss * 2, dss * 16, l3banks);
+			SYSLOG("ngreen", "topology: realDeviceId=0x%x DSS=%u (SS=%u, EU=%u) L3 banks=%u",
+				   NGreen::callback ? NGreen::callback->realDeviceId : 0, dss, dss * 2, dss * 16, l3banks);
 		}
 		
 		// GPU caps override (disabled) – would change MaxSlices 6→5, SARation 2→1, MaxEU/SS 6→5.
@@ -2163,6 +2292,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			// V52: Split patches into always-apply and RPL-only groups.
 			// Real TGL reads topology from fuses correctly; RPL must hardcode
 			// because fuse layout differs and BCS ring doesn't start.
+			SYSLOG("ngreen", "step: applying base binary patch");
 			LookupPatchPlus const patchesAlways[] = {
 				// SKU/device-ID bypass — needed for both (0x9A49 not in whitelist)
 				{activeKext, f3, r3, arrsize(f3),	1},
@@ -2172,14 +2302,51 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 			
 			if (!NGreen::callback->isRealTGL) {
 				// RPL-only: hardcode topology and bypass BCS readiness check
+				SYSLOG("ngreen", "step: applying RPL topology/BCS patches");
 				LookupPatchPlus const patchesRPL[] = {
-					{activeKext, f3b, r3b, arrsize(f3b),	1},      // L3BankCount=8
+					// r3b / r3bbb are NON-const (patched at runtime for the topology). Pass them as plain pointers: with two array
+					// arguments the LookupPatchPlus<N> template constructor wins overload resolution and reads (arrsize, 1) as
+					// (count, skip), so apply() skips the only match and reports NOT FOUND.
+					{activeKext, f3b, static_cast<const UInt8 *>(r3b), arrsize(f3b),	1},      // L3BankCount
 					{activeKext, f3bb, r3bb, arrsize(f3bb),	1},    // MaxEU/SS=8
-					{activeKext, f3bbb, r3bbb, arrsize(f3bbb),	1},// NumSubSlices=12
+					{activeKext, f3bbb, static_cast<const UInt8 *>(r3bbb), arrsize(f3bbb),	1},// NumSubSlices
 					{activeKext, f_devstart, m_devstart, r_devstart, rm_devstart, arrsize(f_devstart), 1}, // BCS bypass
 				};
-				PANIC_COND(!LookupPatchPlus::applyAll(patcher, patchesRPL, address, size), "ngreen",
-					"kextG11HWT Failed to apply RPL-specific patches!");
+				{
+					static const char *const rplNames[] = {"f3b L3BankCount", "f3bb MaxEU/SS", "f3bbb NumSubSlices", "f_devstart BCS bypass"};
+					static const uint32_t rplExpOff[] = {0x28776, 0x28692, 0x28654, 0x9c82};
+					size_t rplFailed = 0;
+					SYSLOG("ngreen", "diag: accelerator window image=0x%llx size=0x%zx", (unsigned long long)address, size);
+					for (size_t pi = 0; pi < arrsize(patchesRPL); pi++) {
+						xeDiagPattern(rplNames[pi], patchesRPL[pi].find, patchesRPL[pi].size, address, size, rplExpOff[pi]);
+						SYSLOG("ngreen", "step: RPL patch %zu (%s) begin", pi, rplNames[pi]);
+						patcher.clearError();
+						bool okp = patchesRPL[pi].apply(patcher, address, size);
+						const int lerr = static_cast<int>(patcher.getError());
+						const uint8_t *site = reinterpret_cast<const uint8_t *>(address) + rplExpOff[pi];
+						const size_t plen = patchesRPL[pi].size;
+						const bool siteIsFind = !memcmp(site, patchesRPL[pi].find, plen);
+						const bool siteIsRepl = !memcmp(site, patchesRPL[pi].replace, plen);
+						SYSLOG("ngreen", "step: RPL patch %zu (%s) apply()=%d lilu-error=%d site now: %s", pi, rplNames[pi], okp, lerr,
+							   siteIsRepl ? "REPLACEMENT (written)" : siteIsFind ? "ORIGINAL (not written)" : "other bytes");
+						if (!okp) {
+							patcher.clearError();
+							if (siteIsRepl) {
+								okp = true;   // the bytes are in place; only Lilu's bookkeeping reported a failure
+							} else if (patchesRPL[pi].findMask == nullptr) {
+								okp = KernelPatcher::findAndReplace(reinterpret_cast<void *>(address), size, patchesRPL[pi].find, plen,
+								                                    patchesRPL[pi].replace, plen);
+								const bool nowRepl = !memcmp(site, patchesRPL[pi].replace, plen);
+								SYSLOG("ngreen", "step: RPL patch %zu (%s) direct findAndReplace=%d, site now %s", pi, rplNames[pi], okp,
+									   nowRepl ? "REPLACEMENT" : "not replaced");
+								patcher.clearError();
+							}
+						}
+						SYSLOG("ngreen", "step: RPL patch %zu (%s) %s", pi, rplNames[pi], okp ? "applied" : "NOT FOUND");
+						if (!okp) rplFailed++;
+					}
+					PANIC_COND(rplFailed != 0, "ngreen", "kextG11HWT Failed to apply %zu RPL-specific patch(es)!", rplFailed);
+				}
 
 				// xe/noccs3 (19/10): o XE-NOCCS2 (cortar enableRenderCompressionWithAccelTask inteira) deixava o driver Metal
 				// usando fast clear / stencil comprimido SEM mapeamento AUX -> hang do RCS no PIPE_CONTROL após o fast clear.
@@ -2339,6 +2506,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					arrsize(f_devstart_long),
 					1
 				};
+				SYSLOG("ngreen", "step: optional long deviceStart patch");
 				if (patchRPLDevstartLong.apply(patcher, address, size)) {
 					SYSLOG("ngreen", "V52: Applied optional long-form deviceStart readiness bypass");
 				} else {
@@ -2487,6 +2655,7 @@ bool Gen11::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 					arrsize(f_v140_case4_store20),
 					1
 				};
+				SYSLOG("ngreen", "step: applying V139-V141 blit mitigations");
 				int v139Applied = 0;
 				v139Applied += patchV139Store10.apply(patcher, address, size) ? 1 : 0;
 				v139Applied += patchV139Store30.apply(patcher, address, size) ? 1 : 0;
@@ -2902,8 +3071,13 @@ void Gen11::configureColorPipeLine(AppleIntel::AppleIntelPlane *that, AppleIntel
 				uint32_t bm_before = getMember<uint32_t>(fb, 0x4248);
 				getMember<uint32_t>(fb, 0x4248) &= ~(1u << 10);
 				uint32_t bm_after  = getMember<uint32_t>(fb, 0x4248);
-				SYSLOG("ngreen", "DIAG[BM]: fb=%p bitmask 0x%08x→0x%08x param2=%d",
-				       fb, bm_before, bm_after, (int)param_2);
+				// Runs on every flip: log only the first few, an unbounded line here fills the 128 KB kernel message buffer.
+				static int bmLogs = 0;
+				if (bmLogs < 20) {
+					++bmLogs;
+					SYSLOG("ngreen", "DIAG[BM]: fb=%p bitmask 0x%08x→0x%08x param2=%d",
+					       fb, bm_before, bm_after, (int)param_2);
+				}
 			}
 		}
 	}
@@ -4990,8 +5164,66 @@ int Gen11::wrapHwSetupMemory(AppleIntel::AppleIntelBaseController *that, AppleIn
 static void v44ScheduleBundleLog(void *accelInstance, unsigned delayMs);
 static void v45ScheduleDelayedCheck(void *accelInstance, unsigned delayMs);
 
+// Debug (ngreenstatedump=<seconds>): every <seconds> s log the render/blitter engine registers (ring, execlist, context-status
+// buffer, interrupts) from a timer thread, so a stuck IntelAccelerator::start() can be explained from the live log.
+static thread_call_t xeDumpTc = nullptr;
+static uint32_t xeDumpInterval = 0;
+static int xeDumpCount = 0;
+static void xeStateDumpWorker(thread_call_param_t, thread_call_param_t) {
+	if (NGreen::callback && NGreen::callback->isMmioReady()) {
+		auto rd = [](uint32_t off) -> uint32_t { return NGreen::callback->readReg32(off); };
+		// Hold a private ForceWake reference (USER bit 1, separate from the driver's bit 0) so the render domain is awake while
+		// sampling; a power-gated domain reads as zeros. Masked write: bit 17 = write-enable for bit 1.
+		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17) | (1u << 1));
+		uint32_t fwAck = 0;
+		for (int i = 0; i < 300; i++) { fwAck = rd(FORCEWAKE_ACK_RENDER_GEN9); if (fwAck & 2) break; IODelay(100); }
+		struct { const char *n; uint32_t b; } eng[] = {{"RCS0", 0x2000}, {"BCS0", 0x22000}};
+		for (auto &e : eng) {
+			SYSLOG("ngreen", "dump#%d %s CTL=%08x HEAD=%08x TAIL=%08x START=%08x MIMODE=%08x MODE=%08x ELS_ST=%08x:%08x ELS_CTL=%08x CSBPTR=%08x IMR=%08x ESR=%08x ACTHD=%08x HWS=%08x",
+			       xeDumpCount, e.n, rd(e.b + 0x3c), rd(e.b + 0x34), rd(e.b + 0x30), rd(e.b + 0x38), rd(e.b + 0x9c), rd(e.b + 0x29c),
+			       rd(e.b + 0x238), rd(e.b + 0x234), rd(e.b + 0x550), rd(e.b + 0x3a0), rd(e.b + 0xa8), rd(e.b + 0xb8), rd(e.b + 0x74), rd(e.b + 0x80));
+		}
+		SYSLOG("ngreen", "dump#%d RCS0 CSB[0..5]=%08x:%08x %08x:%08x %08x:%08x %08x:%08x %08x:%08x %08x:%08x", xeDumpCount,
+		       rd(0x2374), rd(0x2370), rd(0x237c), rd(0x2378), rd(0x2384), rd(0x2380), rd(0x238c), rd(0x2388), rd(0x2394), rd(0x2390), rd(0x239c), rd(0x2398));
+		SYSLOG("ngreen", "dump#%d GT MSTR_IRQ=%08x INTR_DW0=%08x ERROR_GEN6=%08x GDRST=%08x FW_ACK(0xd84, after get)=%08x%s", xeDumpCount,
+		       rd(0x190010), rd(0x190018), rd(0x40a0), rd(0x941c), fwAck, (fwAck & 2) ? "" : "  <-- USER bit NOT acked, render reads unreliable");
+		NGreen::callback->writeReg32(FORCEWAKE_RENDER_GEN9, (1u << 17));   // drop our reference (clear bit 1 only)
+	}
+	if (++xeDumpCount < 40 && xeDumpTc) {
+		uint64_t deadline;
+		clock_interval_to_deadline(xeDumpInterval, kSecondScale, &deadline);
+		thread_call_enter_delayed(xeDumpTc, deadline);
+	}
+}
+
 unsigned long Gen11::start(void *that,void  *param_1)
 {
+	XeSlowScope slowmo;
+	{
+		uint32_t di = 0;
+		if (!xeDumpTc && PE_parse_boot_argn("ngreenstatedump", &di, sizeof(di)) && di > 0 && di <= 30) {
+			xeDumpInterval = di;
+			xeDumpTc = thread_call_allocate(xeStateDumpWorker, nullptr);
+			if (xeDumpTc) {
+				uint64_t deadline;
+				clock_interval_to_deadline(di, kSecondScale, &deadline);
+				thread_call_enter_delayed(xeDumpTc, deadline);
+				SYSLOG("ngreen", "statedump: engine registers will be logged every %u s", di);
+			}
+		}
+	}
+	// ngreenstartdelay=<seconds> (debug): wait before the accelerator starts so the boot-watch daemon (up ~14 s after boot) is
+	// already appending the kernel log when the first GPU access happens. Once, before any hardware access.
+	{
+		static bool delayed = false;
+		uint32_t delaySec = 0;
+		if (!delayed && PE_parse_boot_argn("ngreenstartdelay", &delaySec, sizeof(delaySec)) && delaySec > 0 && delaySec <= 120) {
+			delayed = true;
+			SYSLOG("ngreen", "startdelay: sleeping %u s before IntelAccelerator::start", delaySec);
+			IOSleep(delaySec * 1000);
+			SYSLOG("ngreen", "startdelay: done, starting the accelerator");
+		}
+	}
 	// V44: Configurable scheduler type.
 	// populateAccelConfig reads "GraphicsSchedulerSelect" from the IORegistry.
 	// Types: 3=IGGuC (firmware), 4=IGScheduler4, 5=IGScheduler5 (host preemptive).
@@ -5029,6 +5261,24 @@ unsigned long Gen11::start(void *that,void  *param_1)
 			service->setProperty("GraphicsSchedulerSelect", schedNum);
 			schedNum->release();
 			SYSLOG("ngreen", "V44: injected GraphicsSchedulerSelect=%d", schedType);
+		}
+	}
+
+	// SingleChannelIndex (default 2 = the GuC channel layout): populateAccelConfig stores (value & 3) << 15 into the capability
+	// field accel+0x1190 (mask 0x18000). The host scheduler (IGScheduler5) only initialises its per-queue credit refill values
+	// (IGScheduler5::initPriorityConfig: 4,3,2,1 at +0x5cc/+0x74c/+0x8cc/+0xa4c) when that field is 0; with the default,
+	// IGHardwareRenderCommandStreamer5::evalWorkQueues still runs the host path but resetCredits() refills nothing, so the
+	// scheduler thread spins forever and IntelAccelerator::start() (which waits for it) never returns / never registers.
+	// ngreensci=<0..3> overrides (default 0).
+	{
+		uint32_t sci = 0;
+		PE_parse_boot_argn("ngreensci", &sci, sizeof(sci));
+		if (sci > 3) sci = 0;
+		auto *sciNum = OSNumber::withNumber(static_cast<unsigned long long>(sci), 32);
+		if (sciNum) {
+			service->setProperty("SingleChannelIndex", sciNum);
+			sciNum->release();
+			SYSLOG("ngreen", "V44: injected SingleChannelIndex=%u (host scheduler credits need 0)", sci);
 		}
 	}
 
@@ -6068,10 +6318,12 @@ void Gen11::getGPUInfo(void *that)
 	//   0x1124 = ExecutionUnitCount (= MaxEUPerSubSlice × NumSubSlices)
 	//   0x1150 = Frequency pair (low32=fMaxMHz, high32=fMinMHz)
 	//   0x1164 = L3BankCount
+	uint32_t dss, l3banks;
+	gpuTopology(dss, l3banks);
 	unsigned int numSlices        = 1;
-	unsigned int numSubSlices     = 12;  // 6 DSS × 2 = 12 traditional SS
-	unsigned int maxEUPerSubSlice = 8;   // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
-	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // = 96
+	unsigned int numSubSlices     = dss * 2;  // DSS × 2 = traditional SS (A7A0: 12, A7AB: 8)
+	unsigned int maxEUPerSubSlice = 8;        // 16 EU/DSS ÷ 2 SS/DSS = 8 EU/SS
+	unsigned int totalEU          = maxEUPerSubSlice * numSubSlices; // A7A0: 96, A7AB: 64
 	
 	getMember<UInt32>(that, 0x115c) = numSlices;
 	getMember<UInt32>(that, 0x1158) = numSubSlices;
@@ -6079,13 +6331,13 @@ void Gen11::getGPUInfo(void *that)
 	getMember<UInt32>(that, 0x1124) = totalEU;
 	getMember<UInt32>(that, 0x0dd8) = numSlices;
 	getMember<UInt32>(that, 0x0ddc) = numSubSlices;
-	getMember<UInt32>(that, 0x1164) = 8;  // L3BankCount (confirmed from InsanelyMac TGL logs)
+	getMember<UInt32>(that, 0x1164) = l3banks;  // L3BankCount (8 confirmed from InsanelyMac TGL logs)
 	
 	// Frequency: fMaxFrequencyInMhz=1000, fMinFrequencyInMhz=450 (TGL defaults)
 	getMember<uint64_t>(that, 0x1150) = 0x1C2000003E8ULL;
 	
-	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=8",
-		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU);
+	SYSLOG("ngreen", "getGPUInfo: overridden topology → slices=%u subslices=%u maxEU/SS=%u totalEU=%u L3Banks=%u",
+		   numSlices, numSubSlices, maxEUPerSubSlice, totalEU, l3banks);
 
 }
 
@@ -10660,6 +10912,12 @@ bool Gen11::wrapAppleIntelFramebufferStart(void *that, void *provider)
 	bool ret = FunctionCast(wrapAppleIntelFramebufferStart, callback->oAppleIntelFramebufferStart)(that, provider);
 	SYSLOG("ngreen", "V208: AppleIntelFramebuffer::start fb=0 ret=%d", ret);
 	return ret;
+}
+
+void Gen11::injectWorker(thread_call_param_t, thread_call_param_t)
+{
+	SYSLOG("ngreen", "injectdelay: injecting the accelerator personality now");
+	if (callback) callback->injectAcceleratorPersonality(true);
 }
 
 void Gen11::injectAcceleratorPersonality(bool useTglNames)

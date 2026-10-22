@@ -1374,6 +1374,7 @@ private:
 	// ── Accelerator start & forcewake ──
 	static unsigned long start(void *that,void  *param_1);   // IntelAccelerator::start wrapper
 	static void v54IrqWatchdog(thread_call_param_t, thread_call_param_t);  // V54: IRQ watchdog
+	static void injectWorker(thread_call_param_t, thread_call_param_t);  // debug: delayed accelerator personality injection
 	static void v60GpuHealthMonitor(thread_call_param_t, thread_call_param_t);  // V60: active ERROR_GEN6 suppression + monitor
 	static void v71EmrEnforcer(thread_call_param_t, thread_call_param_t);  // V71: high-freq EMR mask + ERROR clear (50ms)
 	static IOMemoryMap *v85PersistMap;   // V85: persistent FB page 0 mapping for 50ms fill
@@ -1446,6 +1447,8 @@ private:
 	static void setPanelPowerState(void *that,bool param_1);
 	mach_vm_address_t osetPanelPowerState {};
 	
+	static uint32_t hcProbePortMode(void *that);  // safe replacement for HookCase probePortMode (NULL callback)
+	static void  gpuTopology(uint32_t &dss, uint32_t &l3banks);  // per-SKU DSS / L3 banks (A7AB = 4 DSS)
 	static void  getGPUInfo(void *that);     // patches topology for TGL HW (TGL offsets); void per Ghidra
 	mach_vm_address_t ogetGPUInfo {};
 

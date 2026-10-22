@@ -144,6 +144,7 @@ static void seedIGPUPropertiesEarly() {
 	}
 }
 
+
 void NGreen::init() {
     callback = this;
 	
@@ -246,6 +247,30 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		//setRMMIOIfNecessary();
 
         this->deviceId = WIOKit::readPCIConfigValue(this->iGPU, WIOKit::kIOPCIConfigDeviceID);
+        // The config-space read above returns the spoofed id (9A49). The real one is still in "compatible" ("pci8086,a7ab", ...).
+        this->realDeviceId = this->deviceId;
+        if (auto *compat = OSDynamicCast(OSData, this->iGPU->getProperty("compatible"))) {
+            const char *p = static_cast<const char *>(compat->getBytesNoCopy());
+            const size_t len = compat->getLength();
+            for (size_t off = 0; p && off + 12 < len + 1; ) {
+                const char *s = p + off;
+                size_t sl = 0;
+                while (off + sl < len && s[sl] != '\0') sl++;
+                if (sl == 12 && !strncmp(s, "pci8086,", 8)) {
+                    uint32_t id = 0; bool ok = true;
+                    for (int i = 8; i < 12 && ok; i++) {
+                        const char ch = s[i];
+                        if (ch >= '0' && ch <= '9') id = (id << 4) | (ch - '0');
+                        else if (ch >= 'a' && ch <= 'f') id = (id << 4) | (ch - 'a' + 10);
+                        else if (ch >= 'A' && ch <= 'F') id = (id << 4) | (ch - 'A' + 10);
+                        else ok = false;
+                    }
+                    if (ok && id != this->deviceId) { this->realDeviceId = id; break; }
+                }
+                off += sl + 1;
+            }
+        }
+        SYSLOG("ngreen", "device-id: config-space=0x%x (spoof) real=0x%x (from compatible)", this->deviceId, this->realDeviceId);
         this->pciRevision = WIOKit::readPCIConfigValue(NGreen::callback->iGPU, WIOKit::kIOPCIConfigRevisionID);
 
         // V52: Detect real TGL vs spoofed RPL/ADL by CPU model
@@ -268,6 +293,7 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		
 		auto gms = WIOKit::readPCIConfigValue(devInfo->videoBuiltin, WIOKit::kIOPCIConfigGraphicsControl, 0, 16) >> 8;
 		
+		bool gmsValid = true;
 		if (gms < 0x10) {
 			stolen_size = gms * 32;
 		} else if (gms == 0x20 || gms == 0x30 || gms == 0x40) {
@@ -275,9 +301,14 @@ void NGreen::processPatcher(KernelPatcher &patcher) {
 		} else if (gms >= 0xF0 && gms <= 0xFE) {
 			stolen_size = ((gms & 0x0F) + 1) * 4;
 		} else {
+			gmsValid = false;
 			SYSLOG( "ngreen", "PANIC stolen_size=0 check DVMT in bios");
 		}
-		if (stolen_size<128) stolen_size=128;
+		// The size is patched into FBMemMgr_Init (kern_genx.cpp) as the DVMT pre-allocation. Only fall back to 128 MB when
+		// the GMS field could not be decoded: forcing 128 MB on a smaller DVMT (e.g. 64 MB) makes the framebuffer manager
+		// use memory the firmware never reserved for the GPU.
+		if (!gmsValid || stolen_size == 0) stolen_size = 128;
+		SYSLOG("ngreen", "GMS=0x%x valid=%d DVMT=%u MB", static_cast<unsigned>(gms), gmsValid, stolen_size);
 		stolen_size *= (1024 * 1024);
 		SYSLOG("ngreen", "stolen_size 0x%x",stolen_size);
 		

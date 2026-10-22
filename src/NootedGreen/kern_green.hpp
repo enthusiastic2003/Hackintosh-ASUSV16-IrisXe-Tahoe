@@ -47,6 +47,7 @@ class NGreen {
 
     public:
     static NGreen *callback;
+    bool isMmioReady() const { return mmioValid(); }  // public view of mmioValid() for debug workers outside the friend classes
     void init();
     void processPatcher(KernelPatcher &patcher);
     bool processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);
@@ -289,6 +290,7 @@ private:
     uint32_t uefiCtl1 {0};    // UEFI-read PWR_WELL CTL1 value saved in hwInitializeCState
     uint32_t cpuModel {0};  // full display model (family_model)
     uint32_t deviceId {0};
+    uint32_t realDeviceId {0};  // PCI device-id from the IGPU "compatible" property (pci8086,xxxx); deviceId above is the OpenCore spoof
     uint16_t revision {0};
     uint32_t pciRevision {0};
     IOPCIDevice *iGPU {nullptr};
