@@ -120,3 +120,24 @@ macOS Tahoe no longer ships AppleHDA, so AppleALC alone has nothing to patch (th
    `EFI/OC/Kexts` and adds the `Kernel -> Add` entry after AppleALC. `-shdaoff` disables it.
 
 Result: Built-in Output and Built-in Microphone appear and sound plays. The XPS 13 Plus audio code from upstream (AudShim, SOF/SoundWire) does not apply to this laptop.
+
+
+## OpenGL (accelerated, through Metal)
+
+OpenGL on this GPU used to be Apple's software renderer only. Two things were wrong, and the second has a workaround:
+
+1. **Where the driver is looked up.** OpenGL.framework opens `/Library/GPUBundles/<IOGLBundleName>.bundle`, then
+   `/System/Library/Extensions/...`; not `/Library/Extensions`. Found with
+   `sudo fs_usage -w -f filesys <program>`. The Metal and shared driver bundles are in `/Library/GPUBundles` too.
+2. **Apple's Intel TGL OpenGL driver cannot be used.** Its shader compiler (`USC::CreateCompiler`, `GLRenderer/tgl/usc_interface.cpp`)
+   switches on the PCI device id and knows only ids up to Ice Lake (0x8a50-0x8a71), so 0x9a49 hits an assert in
+   `CGLCreateContext`. Faking an Ice Lake id would give Gen11 code for Gen12 hardware.
+
+What works is Apple's own OpenGL-on-Metal layer, `/System/Library/Extensions/AppleMetalOpenGLRenderer.bundle` (it has an
+x86_64 slice). The framework builds the executable path from the driver *name* (`<bundle>/Contents/MacOS/<name>`) and ignores
+`CFBundleExecutable`, so `tools/install-metal-gl.sh` creates `/Library/GPUBundles/AppleIntelTGLGraphicsGLDriver.bundle` as a
+shell of symlinks whose executable name matches and which points at the Metal renderer. `tools/uninstall-metal-gl.sh` puts
+the original bundle back. Result (`tools/diagnostics/gpu-tests/gl-probe.c`): `Intel(R) TGL Unknown`, `4.1 Metal - 90.5`,
+GLSL 4.10, shaders compile and draw correct pixels. Only message: `setProvokingVertexMode: unsupported` (harmless).
+
+Both scripts need `sudo`. A macOS update may replace or invalidate the symlinks; rerun the script.
