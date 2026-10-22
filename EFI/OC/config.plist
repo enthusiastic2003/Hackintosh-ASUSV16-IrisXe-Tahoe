@@ -200,6 +200,10 @@
 			</dict>
 			<key>PciRoot(0x0)/Pci(0x1f,0x3)</key>
 			<dict>
+				<key>class-code</key>
+				<data>
+				AAMEAA==
+				</data>
 				<key>layout-id</key>
 				<data>
 				CwAAAA==
