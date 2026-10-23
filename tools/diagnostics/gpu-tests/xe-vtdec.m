@@ -41,7 +41,7 @@ int main(void) { @autoreleasepool {
   for (int i = 0; i < 2; i++) {
     printf("%s:\n", nm[i]); codifica(cs[i]);
     decodifica("hardware obrigatório", @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder:@YES}, nil);
-    decodifica("hardware obrig. + BGRA", @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder:@YES}, @{(id)kCVPixelBufferPixelFormatTypeKey:@('BGRA')});
+    decodifica("hardware obrig. + BGRA", @{(id)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder:@YES}, @{(id)kCVPixelBufferPixelFormatTypeKey:@((uint32_t)'BGRA')});
     decodifica("padrão", @{}, nil);
     decodifica("software", @{(id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder:@NO}, nil);
   }

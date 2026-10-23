@@ -46,10 +46,12 @@ int main(void) {
     // ---- IOSurface rectangle textures
     GLuint progRect = program(VS_FS, "#version 150\nuniform sampler2DRect t; out vec4 o; void main(){ o = texture(t, gl_FragCoord.xy); }\n");
     GLuint progFill = program(VS_FS, "#version 150\nout vec4 o; void main(){ ivec2 p = ivec2(gl_FragCoord.xy); o = vec4(float((p.x*7+p.y*13+5)&255)/255., float((p.x*7+p.y*13+36)&255)/255., float((p.x*7+p.y*13+67)&255)/255., 1.); }\n");
-    static const int WS[] = { 1, 3, 7, 16, 17, 31, 33, 63, 64, 65, 100, 127, 129, 255, 257, 500, 1000, 1366, 1920 };
+    static const int WS[] = { 1, 3, 7, 16, 17, 31, 33, 63, 64, 65, 100, 127, 129, 255, 257, 500, 1000, 1366, 1920,
+                              1563, 1920, 2560, 3000 };
+    static const int HS[] = { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 817, 1083, 1440, 1700 };
     int badA = 0, badB = 0, nA = 0; char la[200] = "", lb[200] = "";
     for (unsigned i = 0; i < sizeof(WS) / sizeof(WS[0]); i++) {
-        int w = WS[i], h = 9; IOSurfaceRef s = make_surface(w, h);
+        int w = WS[i], h = HS[i]; IOSurfaceRef s = make_surface(w, h);
         if (!s) { printf("IOSurfaceCreate failed w=%d\n", w); continue; }
         size_t bpr = IOSurfaceGetBytesPerRow(s); nA++;
         // (a) CPU fill -> bind as rectangle texture -> sample into an FBO target -> compare
