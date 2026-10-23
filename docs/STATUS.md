@@ -25,7 +25,7 @@
 | Colour profile changes | selecting another profile (e.g. ITU-709) in Displays caused three page-fault panics in GPU memory management (`newResourceWithClientBuffer`, `orphanIt`/`releaseDescriptors`, `IGHardwarePageTable::commitRange`) | keep the factory profile (`tools/xe-perfil padrao` restores it) |
 | Brightness keys | the TGL framebuffer never writes the PWM duty | `xe-brilho` |
 | Trackpad / touchscreen | fixed 2026-10-20: GPIO/APIC interrupts instead of forced polling (the I2C bus used to get stuck, "Timeout waiting for bus not to be busy") | — |
-| Hardware video decode/encode | off by default (XE-NOGVA); bring-up in progress with `-ngreengva` + patched VA plugin (`macos/vadriver/`): AppleGVA now loads and initialises the TGL plugin, contexts and bitstream buffers are created; it stops at the NV12 output surface | software decode |
+| Safari hardware video decode; hardware encode | decode works for other VideoToolbox clients (Firefox) with `-ngreengva` + the patched VA plugin (`macos/vadriver/build-vadriver.sh`, installed in `/Library/GPUBundles`): H.264 and HEVC are bit-exact against software decode (`tools/diagnostics/gpu-tests/xe-vtcmp.m`, ASUS V16, 2026-10-23). Safari's `com.apple.WebKit.GPU` sandbox cannot map `/Library/GPUBundles`, so it decodes on the CPU. Encode is untested. Without `-ngreengva`, XE-NOGVA keeps all decode on software | Safari: software decode |
 | Extended range 10-bit (`w30r` / BGR10_XR) | not supported by the 16.0.32 Metal driver | — |
 | Small glitch on the lock-screen clock | cosmetic | — |
 

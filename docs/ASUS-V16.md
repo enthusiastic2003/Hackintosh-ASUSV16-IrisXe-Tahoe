@@ -188,7 +188,26 @@ The "stale index cache" reading above was incomplete. Later runs of `metal-index
 - None of these cures it: `memoryBarrierWithScope:` in the render or compute encoder, an `MTLFence` compute -> render (worse: 170), `useResource:usage:` on the index buffer, binding the index buffer as a vertex buffer, a blit between, a different buffer per row (this one does avoid it: 0), or issuing PIPE_CONTROLs with any FLUSH_TYPE mask (all bits set included) from the render encoder before each indexed draw (`writePipeControl`, global symbol in the driver, C++ object in ivar `_pIGRenderEncoder`; test hook in the session scratchpad, not in the repo).
 - Apple's GL-on-Metal layer does `glBufferSubData` as: blit into a scratch buffer, then a 1x1x1 compute kernel writing the destination, then the draw, all in one command buffer (seen with a spy library hooking `MTLIGAccel*CommandEncoder`).
 
-So within a command buffer the driver does not stall the draw until a preceding compute dispatch has finished (the barrier code only sets dirty bits that no draw turns into a stall). Calling the base-class `IGAccelEncoderBase::writePipeControl` (local symbol, driver +0x98cb8) on the compute encoder from a hook crashed. Not fixed. Untried: a real patch of the driver's compute `endEncoding` (+0x1e4ac `IGAccelComputeCommandEncoder::endEncoding`) to emit a CS-stall PIPE_CONTROL; Minecraft's Vulkan backend (MoltenVK) does not go through the GL layer.
+So within a command buffer the driver does not stall the draw until a preceding compute dispatch has finished (the barrier code only sets dirty bits that no draw turns into a stall). Calling the base-class `IGAccelEncoderBase::writePipeControl` (local symbol, driver +0x98cb8) on the compute encoder from a hook crashed. **Superseded (23 Oct): fixed in the kernel patch, see "Resolution" below.** The compute `endEncoding` has no pipe control to patch; the missing wait was in `barrierSubmission`.
+
+
+### Resolution (23 Oct 2026): the barrier the spoof path skipped
+
+Everything above pointed at "the driver does not wait for the compute pass", and the cause is in the kernel patch, not the Metal
+driver. Apple's compute `endEncoding` only commits a segment header (`CommandStreamCompute::commit`, wait/signal fence lists);
+ordering between segments is done by `IGAccelCommandQueue`'s `barrierSubmission(queue, accel, cmdDesc, event, count, list)` in the
+TGL kext (offset 0x73b7c). It merges the pending events of every segment resource list (`mergeEventsToBarrierExcluding`) into a
+barrier event and either writes a GPU barrier command (`IOAccelEventMachineFast2::writeEventBarrierCommand`, vtable +0x1f0) or
+CPU-waits (`finishEvent`, +0x188), and returns whether the dependencies are covered.
+
+NootedGreen's V130 replaced it on spoofed chips with "return 1" because Apple's original crashes at +0x198, dereferencing
+`ctx+0xb8` of the Blit2D/Blit3D/DepthResolve/ColorResolve contexts, which is NULL there (V165). That dropped the dependency merge
+for every segment. The new default (V130 mode 4, `xeBarrierCpuWait`) follows Apple's fallback path without the BCS blit-context
+part and returns the real result; modes 0-3 are kept (`-ngreenV130pass` restores the old bypass).
+
+Result with `metal-index-probe.m`: M3, M6, M7, M8, M9, M11, M14, M15 go from 10-92 wrong rows of 256 to **0**. **M13 (an explicit
+`MTLFence` compute -> render) is still 170 of 256**: fences go through the `FenceList` in the segment header, a different route,
+still open. Minecraft on OpenGL: almost all glitches gone (Vulkan is still much faster). `barrierSubmission` is called roughly 80-100 times a second in the first minutes; the cost of the CPU wait is not measured.
 
 
 ## Minecraft's Vulkan backend (MoltenVK) crashed in the driver's GPU counter code
@@ -200,3 +219,81 @@ stageutilization) and `supportsCounterSampling:` for draw, dispatch and blit bou
 dereferences a null member. libxedrv v19 turns counter sampling off (`supportsCounterSampling:` NO, empty `counterSets`,
 `newCounterSampleBufferWithDescriptor:error:` returns nil with an error), the same way it already disables binary archives and
 dynamic libraries. Verified with a Metal probe: 3 counter sets before, 0 after.
+
+## Firefox: the ANGLE renderer works, native OpenGL garbles (parked)
+
+`gfx.webrender.enable-angle = true` (ANGLE straight to Metal, `libGLESv2.dylib` in the GPU helper; checked with `sample <pid>`)
+renders correctly. With Apple's OpenGL layer Firefox 158 garbles: the page is mostly empty with long thin diagonal staircases, and
+the artifacts are baked into WebRender's cached tiles (they scroll with the page and come back when scrolled; fixed elements keep
+their own). What was established, in order:
+
+- WebRender's texture-cache atlases (`debug.texture-cache` overlay) hold correct images (and plausible glyph data); the render targets are mostly
+  empty. Nothing is wrong in the uploads.
+- With `debug.disable-opaque-pass` the page renders correctly; with only the alpha pass disabled, only the flat background draws
+  (no streaks). Opaque and alpha draws are the **same program** (`ps_quad_textured`, unoptimized sources, since
+  `use-optimized-shaders=false`) with blend off or on, depth test disabled; the whole frame is `glDrawElementsInstanced`,
+  triangles, 6 indices per quad, plus `ps_clear` draws that write depth with `GL_ALWAYS` (traced with `tools/diagnostics/gl-trace/glspy.c`).
+- Isolated probes all pass: texture uploads (7 formats x 7 paths x 21 widths), IOSurface textures, blits, instancing, dual-source
+  blend, swizzle (`gl-probe-textures.c`, `gl-probe-wr.c`), large two-triangle quads with depth, blend, clipping and scissor
+  (`gl-probe-quads.c`), texture-array layers as render targets (`gl-probe-array.c`), 600-quad opaque-pass depth stress with ties,
+  clip-plane depths and program switches (`gl-probe-depth.c`), opaque-then-alpha in one render pass (`gl-probe-twopass.c`),
+  `fwidth` on large quads across the diagonal seam (`gl-probe-deriv.c`).
+- Untried because the stop came first: patching the **real** shader in flight. `glspy.c` can apply text substitutions to shader
+  sources (`GLSPY_SUBST`); `~/glspy-patches/noaa.sub` (edge AA off) and `intaddr.sub` (unsigned `%`/`/` by 1024 in the GPU-buffer
+  address) are ready, run with `firefox-glspy.sh patch <name>` (the launcher scripts are in the home directory, not the repo).
+
+Traps found on the way: Firefox writes the prefs it ran with into `prefs.js`, so removing a line from `user.js` does **not** undo a
+debug pref; and in Objective-C `@('BGRA')` boxes one *char* (65), not the 32-bit code, so IOSurface and VideoToolbox tests that
+use it silently test an invalid pixel format (it also sat in `xe-vtdec.m`, now fixed). Write `@((uint32_t)'BGRA')`.
+
+
+## Compiler service: signed-integer flat varyings (`libxecompfix`)
+
+Any GL program with a signed-integer flat varying (`flat int`, `ivec2..4`) failed to link in the Metal compiler
+(`Link failed: The type of fragment input user(slotN) does not match the type of the corresponding vertex shader output`);
+unsigned and float varyings linked. Apple's layer then fell back to software vertex processing, which returned wrong data
+above 8 varying slots (`gl-probe-varyings.c`; WebRender uses flat `ivec` varyings in every shader). The check is in
+`MTLCompiler.framework` (the out-of-process compiler service): it compares the fragment input type with the vertex output type
+and only normalises unsigned to signed when the fragment record has flag 0x40.
+
+`macos/src/libxecompfix.c` is a dylib that our bridge plugin (`/System/Library/Caches/xe.bundle`, the one the Metal driver
+loads) pulls into `MTLCompilerService`; it replaces the `cmp [rbp-0x68],eax; je` with a stub accepting types that differ only in
+signedness (a 14-byte thunk in the image's own page padding, since user code cannot allocate inside the shared cache region).
+Build `tools/build-xecompfix.sh`, install `sudo tools/install-xecompfix.sh` (runs a GL test and rolls back by itself),
+remove `sudo tools/uninstall-xecompfix.sh`. After it, every pipeline links in Firefox (`falhas=0`). It does not fix the
+native-GL garble above.
+
+
+## Hardware video decode (H.264 and HEVC): works
+
+`-ngreengva` in the boot-args plus the patched VA plugin (`macos/vadriver/build-vadriver.sh /Library/Extensions/AppleIntelTGLGraphicsVADriver.bundle`,
+installed in `/Library/GPUBundles`, killall `VTDecoderXPCService`). NootedGreen sets `IOVARendererID` (XE-GVAID) and
+`IOGVAHEVCDecode` (XE-GVAHEVC) itself. Verified on the A7AB with `tools/diagnostics/gpu-tests/xe-vtcmp.m`: the same H.264 and HEVC
+bitstreams (1280x720, I and P frames, two patterns) decoded in hardware and in software are **byte-identical** (0 of 41,472,000 bytes),
+and hardware with BGRA output decodes all frames. Firefox reports hardware decoding and plays video with a normal launch: the
+decode runs in the system `VTDecoderXPCService` (it has the VA driver and `AppleGVAHEVCDecoder` mapped), outside Firefox's sandbox.
+Safari still decodes on the CPU (its GPU-process sandbox cannot map `/Library/GPUBundles`). Not covered: B-frame streams, other
+resolutions, encode. Without `-ngreengva` XE-NOGVA keeps everything on software.
+
+
+## Stability notes (23 Oct 2026)
+
+- **Forcewake leak (XE-RC6FW, from upstream):** present here (`xe-fw-underflow` 5, `xe-fw-leakdrops` 1 after boot); the patch drops it.
+  Idle GT power before/after is not measured (`sudo powermetrics --samplers gpu_power -n 1 -i 2000`).
+- **GPU reset recovery (XE-GPUREC, from upstream):** installed (`sig=11111 route=1`), never exercised. The restart that happens in
+  the first minute of every boot (`waitForStamp` timeout at about 35-50 s, then `GPURestartEnd`) does not reach it.
+- **Trackpad pane in System Settings hangs the GPU, reproducibly:** `RCS0 stuck`, `IPEHR=7a000004` (a `PIPE_CONTROL`), ring
+  `HEAD=0x134 TAIL=0x150` identical on two attempts, 3-6 s after `com.apple.Trackpad-Settings.extension` starts. The same
+  kind of stall (`RCS0` stuck at a `PIPE_CONTROL`) appeared twice earlier, before the barrier change. Cause not found.
+- **Panic on wake from sleep:** `AppleIntelFramebuffer::prepareToExitWake` -> `AppleIntelBaseController::hwSaveNVRAM` -> a call into the
+  reserved virtual `IODTPlatformExpert::_RESERVEDIODTPlatformExpert1` (panic string "called"). `kern_genx.cpp` stubs `hwSaveNVRAM` for the
+  Genx path, but the TGL framebuffer path (`kern_gen11.cpp`) has no such route. The machine does enter sleep (`hibernatemode 3`).
+  Not fixed.
+
+
+## Diagnostics added (in `tools/diagnostics/`)
+
+`gpu-tests/`: `gl-probe-textures.c`, `-wr.c`, `-quads.c`, `-array.c`, `-depth.c`, `-twopass.c`, `-deriv.c`, `-varyings.c`, `xe-vtcmp.m`;
+`gl-trace/glspy.c` (logs the OpenGL state and draw stream of a process with `DYLD_INSERT_LIBRARIES`, dumps shader sources per
+program, applies shader text substitutions; one log file per process). Upstream commits reviewed 23 Oct: XE-RC6FW and XE-GPUREC taken;
+audio (SoundWire), fingerprint, haptic bar, power-button/lid agents, itlwm and the XPS EFI are specific to the reference laptop.

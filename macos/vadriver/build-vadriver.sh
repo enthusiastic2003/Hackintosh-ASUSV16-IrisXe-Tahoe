@@ -5,7 +5,7 @@
 # it is an Apple binary and is not redistributed here. Output: <out dir>/AppleIntelTGLGraphicsVADriver.bundle
 # (default macos/out/), ad-hoc signed. --trace also links tools/diagnostics/xe-vatrace.c (diagnostics only).
 # Every patch script checks the original bytes before writing and stops on a mismatch.
-# HEVC also needs the accelerator property IOGVAHEVCDecode (NootedGreen XE-GVAHEVC, with -ngreengva).
+# HEVC also needs the accelerator property IOGVAHEVCDecode; NootedGreen XE-GVAHEVC sets it by itself whenever -ngreengva is on.
 # Install (needs -ngreengva in boot-args so the accelerator advertises hardware video):
 #   sudo rm -rf /Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle
 #   sudo ditto <out dir>/AppleIntelTGLGraphicsVADriver.bundle /Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle
