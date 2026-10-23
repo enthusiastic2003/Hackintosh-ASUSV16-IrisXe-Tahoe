@@ -9,7 +9,7 @@ made from Windows on the target laptop, to be confirmed on the first macOS boot.
 | iGPU | `8086:A7A0`, 96 EU (6 DSS) | `8086:A7AB`, **64 EU (4 DSS)** |
 | Panel | 3840×2400, 4-lane eDP | CSOT `MNG007QX2-2`, 1920×1200 @ 60 Hz (EDID range 48–144 Hz), 162.24 MHz |
 | dGPU | none | RTX 5050 (`10DE:2D98`, behind PEG1 `00:01.0`) |
-| Wi-Fi / BT | Intel (itlwm, IntelBluetoothFirmware) | Realtek 8852BE / Realtek USB BT — **no macOS driver** |
+| Wi-Fi / BT | Intel (itlwm, IntelBluetoothFirmware) | Realtek 8852BE / Realtek USB BT `13d3:3571`. Bluetooth works: [macos/bluetooth/README.md](../macos/bluetooth/README.md). Wi-Fi: no driver in this repo |
 | Touchpad | I2C-HID on the reference laptop's ACPI paths | I2C-HID `ASCP1201` on Serial IO `51E8` |
 | Audio | SoundWire (unsupported) | Realtek ALC256 over HDA (AppleALC layout 11) |
 
